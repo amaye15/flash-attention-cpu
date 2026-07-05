@@ -40,6 +40,11 @@ use rayon::prelude::*;
 /// `out`: `[seq_len_q, d_head]`, overwritten. Peak extra memory is
 /// `O(block_size_q * (d_head + block_size_kv))`, independent of the full
 /// sequence length.
+///
+/// # Panics
+///
+/// Panics if `q.len() != seq_len_q * d_head`, `k.len() != seq_len_k * d_head`,
+/// `v.len() != seq_len_k * d_head`, or `out.len() != seq_len_q * d_head`.
 #[allow(clippy::too_many_arguments)]
 pub fn flash_attention_v1(
     q: &[f32],
@@ -84,6 +89,11 @@ pub fn flash_attention_v1(
 /// Batched multi-head attention. See [`flash_attention_v1`] for the
 /// single-head algorithm; this parallelizes over `batch * heads` and,
 /// within each head, over query blocks.
+///
+/// # Panics
+///
+/// Panics if `q`/`k`/`v`/`out` don't match `batch * heads * seq_len_q *
+/// d_head` (`q`/`out`) or `batch * heads * seq_len_k * d_head` (`k`/`v`).
 #[allow(clippy::too_many_arguments)]
 pub fn flash_attention_multihead_v1(
     q: &[f32],

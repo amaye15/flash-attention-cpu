@@ -50,6 +50,11 @@ use rayon::prelude::*;
 /// sequence length — the score scratch is double-buffered (two tiles
 /// resident at once for the pipeline), so this is roughly 2x v1/v2's tile
 /// scratch, still independent of `seq_len`.
+///
+/// # Panics
+///
+/// Panics if `q.len() != seq_len_q * d_head`, `k.len() != seq_len_k * d_head`,
+/// `v.len() != seq_len_k * d_head`, or `out.len() != seq_len_q * d_head`.
 #[allow(clippy::too_many_arguments)]
 pub fn flash_attention_v3(
     q: &[f32],
@@ -94,6 +99,11 @@ pub fn flash_attention_v3(
 /// Batched multi-head attention. See [`flash_attention_v3`] for the
 /// single-head algorithm; this parallelizes over `batch * heads` and,
 /// within each head, over query blocks.
+///
+/// # Panics
+///
+/// Panics if `q`/`k`/`v`/`out` don't match `batch * heads * seq_len_q *
+/// d_head` (`q`/`out`) or `batch * heads * seq_len_k * d_head` (`k`/`v`).
 #[allow(clippy::too_many_arguments)]
 pub fn flash_attention_multihead_v3(
     q: &[f32],

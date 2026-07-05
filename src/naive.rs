@@ -5,6 +5,11 @@
 
 /// `q`: [seq_len_q, d_head], `k`/`v`: [seq_len_k, d_head], row-major.
 /// `out`: [seq_len_q, d_head].
+///
+/// # Panics
+///
+/// Panics if `q.len() != seq_len_q * d_head`, `k.len() != seq_len_k * d_head`,
+/// `v.len() != seq_len_k * d_head`, or `out.len() != seq_len_q * d_head`.
 #[allow(clippy::too_many_arguments)]
 pub fn naive_attention(
     q: &[f32],

@@ -1,5 +1,10 @@
 # flash-attention-cpu
 
+[![CI](https://github.com/amaye15/flash-attention-cpu/actions/workflows/ci.yml/badge.svg)](https://github.com/amaye15/flash-attention-cpu/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/flash-attention-cpu.svg)](https://crates.io/crates/flash-attention-cpu)
+[![docs.rs](https://docs.rs/flash-attention-cpu/badge.svg)](https://docs.rs/flash-attention-cpu)
+[![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+
 Pure-Rust, CPU-optimized Flash Attention: three explicit algorithm variants
 (v1, v2, v3) built on tiled online-softmax, hand-vectorized SIMD (AVX-512F
 and AVX2+FMA on x86_64, NEON on aarch64, SIMD128 on wasm32) with a portable
@@ -347,6 +352,7 @@ tests/wasm_simd.rs     wasm-bindgen-test suite, run via `wasm-pack test --node`
 benches/bench.rs       Criterion benchmarks (naive, v1, v2/flash, v3) — not wasm32
 examples/basic.rs       usage demo
 examples/bench_quick.rs manual-timing sanity check (no Criterion wait)
+fuzz/fuzz_targets/flash_attention.rs   cargo-fuzz differential fuzzing, v1/v2/v3 vs. each other
 .cargo/config.toml      enables wasm32 SIMD128 for this repo's own builds/tests
 ```
 
@@ -358,3 +364,14 @@ cargo test --target x86_64-apple-darwin                # AVX-512/AVX2 cross-targ
                                                         # (won't execute without real x86_64 hardware/Rosetta)
 wasm-pack test --node                                  # WASM SIMD128, real execution via Node.js
 ```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for more (adding a new SIMD kernel,
+fuzzing, MSRV policy).
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option. Unless you explicitly state
+otherwise, any contribution intentionally submitted for inclusion in this
+crate, as defined in the Apache-2.0 license, shall be dual-licensed as
+above, without any additional terms or conditions.
