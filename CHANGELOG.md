@@ -15,6 +15,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CONTRIBUTING.md`, this changelog.
 - MSRV set to 1.89 (verified empirically — the AVX-512F intrinsics are the
   binding constraint; NEON/SIMD128/rayon all work much earlier).
+- Register-blocked micro-kernel: `Kernel::dot4`/`Kernel::axpy4` process 4
+  query rows at once, sharing each streamed `K`/`V` row's vector loads across
+  four independent FMA accumulator chains (BLIS/OpenBLAS-style register
+  tiling), implemented for all five kernels (scalar, AVX2, AVX-512F, NEON,
+  SIMD128) and wired into the QK^T/PV loops of `v1`/`v2`/`v3` with a
+  scalar-row fallback for the `block_size_q % 4` remainder. Validated first
+  as an isolated NEON micro-benchmark (1.74x at `d_head=64`, 1.29x at
+  `d_head=128`) before being wired in.
+- `Kernel::sub_exp_inplace` fuses the online-softmax subtract-max and `exp`
+  steps into a single SIMD pass per kernel (previously two separate
+  traversals of the score row).
+- `tests/correctness.rs::block_size_q_not_a_multiple_of_four`, covering the
+  register-blocked micro-kernel's scalar-row remainder path.
+
+### Changed
+
+- `run_v1`/`run_v2`/`run_v3` now use Rayon's `for_each_init` to allocate each
+  query block's scratch buffers (`m`/`l`/`acc`/scores) once per worker thread
+  instead of once per block.
+- Measured net effect of the above (Apple M4, aarch64, NEON kernel): roughly
+  1.9-2x single-threaded speedup over the pre-optimization baseline across
+  `flash_attention_v1/_v2/_v3`, causal and non-causal, at every benchmarked
+  `seq_len`; `naive_attention` is unaffected (it doesn't use the `Kernel`
+  trait). See the README's Benchmarks section for full before/after tables.
 
 ## [0.1.0]
 

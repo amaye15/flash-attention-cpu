@@ -30,9 +30,22 @@ impl Kernel for ScalarKernel {
     }
 
     #[inline]
-    unsafe fn exp_inplace(x: &mut [f32]) {
+    unsafe fn dot4(a0: &[f32], a1: &[f32], a2: &[f32], a3: &[f32], b: &[f32]) -> [f32; 4] {
+        // No register-blocking benefit possible without SIMD lanes to
+        // share loads across — this exists purely so call sites in
+        // `v1.rs`/`v2.rs`/`v3.rs` don't need an arch-specific branch.
+        [
+            Self::dot(a0, b),
+            Self::dot(a1, b),
+            Self::dot(a2, b),
+            Self::dot(a3, b),
+        ]
+    }
+
+    #[inline]
+    unsafe fn sub_exp_inplace(x: &mut [f32], m: f32) {
         for v in x.iter_mut() {
-            *v = v.exp();
+            *v = (*v - m).exp();
         }
     }
 
@@ -42,6 +55,15 @@ impl Kernel for ScalarKernel {
         for (d, s) in dst.iter_mut().zip(src.iter()) {
             *d += s * scale;
         }
+    }
+
+    #[inline]
+    unsafe fn axpy4(dst: [&mut [f32]; 4], b: &[f32], scale: [f32; 4]) {
+        let [d0, d1, d2, d3] = dst;
+        Self::axpy(d0, b, scale[0]);
+        Self::axpy(d1, b, scale[1]);
+        Self::axpy(d2, b, scale[2]);
+        Self::axpy(d3, b, scale[3]);
     }
 
     #[inline]

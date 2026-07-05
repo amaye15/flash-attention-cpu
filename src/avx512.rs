@@ -37,13 +37,23 @@ impl Kernel for Avx512Kernel {
     }
 
     #[inline]
-    unsafe fn exp_inplace(x: &mut [f32]) {
-        exp_inplace_avx512(x)
+    unsafe fn dot4(a0: &[f32], a1: &[f32], a2: &[f32], a3: &[f32], b: &[f32]) -> [f32; 4] {
+        dot4_avx512(a0, a1, a2, a3, b)
+    }
+
+    #[inline]
+    unsafe fn sub_exp_inplace(x: &mut [f32], m: f32) {
+        sub_exp_inplace_avx512(x, m)
     }
 
     #[inline]
     unsafe fn axpy(dst: &mut [f32], src: &[f32], scale: f32) {
         axpy_avx512(dst, src, scale)
+    }
+
+    #[inline]
+    unsafe fn axpy4(dst: [&mut [f32]; 4], b: &[f32], scale: [f32; 4]) {
+        axpy4_avx512(dst, b, scale)
     }
 
     #[inline]
@@ -93,6 +103,45 @@ unsafe fn dot_avx512(a: &[f32], b: &[f32]) -> f32 {
         i += 1;
     }
     sum
+}
+
+/// Four dot products sharing `b`'s vector loads across four independent FMA
+/// accumulator chains — see [`crate::kernel::Kernel::dot4`] for why this is
+/// faster than four separate [`dot_avx512`] calls.
+#[target_feature(enable = "avx512f")]
+unsafe fn dot4_avx512(a0: &[f32], a1: &[f32], a2: &[f32], a3: &[f32], b: &[f32]) -> [f32; 4] {
+    debug_assert_eq!(a0.len(), b.len());
+    debug_assert_eq!(a1.len(), b.len());
+    debug_assert_eq!(a2.len(), b.len());
+    debug_assert_eq!(a3.len(), b.len());
+    let len = b.len();
+    let mut acc0 = _mm512_setzero_ps();
+    let mut acc1 = _mm512_setzero_ps();
+    let mut acc2 = _mm512_setzero_ps();
+    let mut acc3 = _mm512_setzero_ps();
+    let mut i = 0usize;
+    while i + 16 <= len {
+        let bv = _mm512_loadu_ps(b.as_ptr().add(i)); // loaded once, shared 4 ways
+        acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(a0.as_ptr().add(i)), bv, acc0);
+        acc1 = _mm512_fmadd_ps(_mm512_loadu_ps(a1.as_ptr().add(i)), bv, acc1);
+        acc2 = _mm512_fmadd_ps(_mm512_loadu_ps(a2.as_ptr().add(i)), bv, acc2);
+        acc3 = _mm512_fmadd_ps(_mm512_loadu_ps(a3.as_ptr().add(i)), bv, acc3);
+        i += 16;
+    }
+    let mut sums = [
+        _mm512_reduce_add_ps(acc0),
+        _mm512_reduce_add_ps(acc1),
+        _mm512_reduce_add_ps(acc2),
+        _mm512_reduce_add_ps(acc3),
+    ];
+    while i < len {
+        sums[0] += a0[i] * b[i];
+        sums[1] += a1[i] * b[i];
+        sums[2] += a2[i] * b[i];
+        sums[3] += a3[i] * b[i];
+        i += 1;
+    }
+    sums
 }
 
 /// Vectorized exp over 16 lanes. See module docs for the algorithm.
@@ -152,18 +201,22 @@ unsafe fn exp512_ps(x: __m512) -> __m512 {
     _mm512_mul_ps(y, pow2n)
 }
 
+/// Fused `x[i] = exp(x[i] - m)`: subtract and exponential in the same pass
+/// over `x` (one load/store per lane instead of two separate passes).
 #[target_feature(enable = "avx512f")]
-unsafe fn exp_inplace_avx512(x: &mut [f32]) {
+unsafe fn sub_exp_inplace_avx512(x: &mut [f32], m: f32) {
     let len = x.len();
+    let vm = _mm512_set1_ps(m);
     let mut i = 0usize;
     while i + 16 <= len {
         let v = _mm512_loadu_ps(x.as_ptr().add(i));
+        let v = _mm512_sub_ps(v, vm);
         let r = exp512_ps(v);
         _mm512_storeu_ps(x.as_mut_ptr().add(i), r);
         i += 16;
     }
     while i < len {
-        x[i] = x[i].exp();
+        x[i] = (x[i] - m).exp();
         i += 1;
     }
 }
@@ -183,6 +236,42 @@ unsafe fn axpy_avx512(dst: &mut [f32], src: &[f32], scale: f32) {
     }
     while i < len {
         dst[i] += src[i] * scale;
+        i += 1;
+    }
+}
+
+/// Four `axpy`s sharing `b`'s vector loads across four destination rows —
+/// see [`crate::kernel::Kernel::axpy4`].
+#[target_feature(enable = "avx512f")]
+unsafe fn axpy4_avx512(dst: [&mut [f32]; 4], b: &[f32], scale: [f32; 4]) {
+    let [d0, d1, d2, d3] = dst;
+    debug_assert_eq!(d0.len(), b.len());
+    debug_assert_eq!(d1.len(), b.len());
+    debug_assert_eq!(d2.len(), b.len());
+    debug_assert_eq!(d3.len(), b.len());
+    let len = b.len();
+    let vs0 = _mm512_set1_ps(scale[0]);
+    let vs1 = _mm512_set1_ps(scale[1]);
+    let vs2 = _mm512_set1_ps(scale[2]);
+    let vs3 = _mm512_set1_ps(scale[3]);
+    let mut i = 0usize;
+    while i + 16 <= len {
+        let bv = _mm512_loadu_ps(b.as_ptr().add(i)); // loaded once, shared 4 ways
+        let r0 = _mm512_fmadd_ps(bv, vs0, _mm512_loadu_ps(d0.as_ptr().add(i)));
+        _mm512_storeu_ps(d0.as_mut_ptr().add(i), r0);
+        let r1 = _mm512_fmadd_ps(bv, vs1, _mm512_loadu_ps(d1.as_ptr().add(i)));
+        _mm512_storeu_ps(d1.as_mut_ptr().add(i), r1);
+        let r2 = _mm512_fmadd_ps(bv, vs2, _mm512_loadu_ps(d2.as_ptr().add(i)));
+        _mm512_storeu_ps(d2.as_mut_ptr().add(i), r2);
+        let r3 = _mm512_fmadd_ps(bv, vs3, _mm512_loadu_ps(d3.as_ptr().add(i)));
+        _mm512_storeu_ps(d3.as_mut_ptr().add(i), r3);
+        i += 16;
+    }
+    while i < len {
+        d0[i] += b[i] * scale[0];
+        d1[i] += b[i] * scale[1];
+        d2[i] += b[i] * scale[2];
+        d3[i] += b[i] * scale[3];
         i += 1;
     }
 }
@@ -258,7 +347,7 @@ mod tests {
         }
         let xs: Vec<f32> = (-800..800).map(|i| i as f32 * 0.1).collect();
         let mut got = xs.clone();
-        unsafe { exp_inplace_avx512(&mut got) };
+        unsafe { sub_exp_inplace_avx512(&mut got, 0.0) };
         let mut max_rel_err = 0.0f32;
         for (x, g) in xs.iter().zip(got.iter()) {
             let want = x.exp();
@@ -288,6 +377,71 @@ mod tests {
                 (scalar - simd).abs() < 1e-3 * (scalar.abs() + 1.0),
                 "len={len} scalar={scalar} simd={simd}"
             );
+        }
+    }
+
+    #[test]
+    fn dot4_matches_four_dots() {
+        if !avx512_available() {
+            return;
+        }
+        for len in [0usize, 1, 3, 4, 5, 7, 8, 9, 16, 17, 33] {
+            let mk =
+                |seed: f32| -> Vec<f32> { (0..len).map(|i| (i as f32 * seed).sin()).collect() };
+            let a0 = mk(0.11);
+            let a1 = mk(0.23);
+            let a2 = mk(0.37);
+            let a3 = mk(0.51);
+            let b = mk(0.71);
+
+            let want = [
+                unsafe { dot_avx512(&a0, &b) },
+                unsafe { dot_avx512(&a1, &b) },
+                unsafe { dot_avx512(&a2, &b) },
+                unsafe { dot_avx512(&a3, &b) },
+            ];
+            let got = unsafe { dot4_avx512(&a0, &a1, &a2, &a3, &b) };
+            for k in 0..4 {
+                assert!(
+                    (want[k] - got[k]).abs() < 1e-3 * (want[k].abs() + 1.0),
+                    "len={len} k={k} want={} got={}",
+                    want[k],
+                    got[k]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn axpy4_matches_four_axpys() {
+        if !avx512_available() {
+            return;
+        }
+        for len in [0usize, 1, 3, 4, 5, 7, 8, 9, 16, 17, 33] {
+            let mk =
+                |seed: f32| -> Vec<f32> { (0..len).map(|i| (i as f32 * seed).cos()).collect() };
+            let b = mk(0.71);
+            let scale = [1.1f32, -2.2, 0.0, 3.3];
+
+            let mut want = [mk(0.11), mk(0.23), mk(0.37), mk(0.51)];
+            for (row, &s) in want.iter_mut().zip(scale.iter()) {
+                unsafe { axpy_avx512(row, &b, s) };
+            }
+
+            let mut got = [mk(0.11), mk(0.23), mk(0.37), mk(0.51)];
+            let [g0, g1, g2, g3] = &mut got;
+            unsafe { axpy4_avx512([g0, g1, g2, g3], &b, scale) };
+
+            for k in 0..4 {
+                for i in 0..len {
+                    assert!(
+                        (want[k][i] - got[k][i]).abs() < 1e-4,
+                        "len={len} k={k} i={i} want={} got={}",
+                        want[k][i],
+                        got[k][i]
+                    );
+                }
+            }
         }
     }
 

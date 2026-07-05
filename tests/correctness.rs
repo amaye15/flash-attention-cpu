@@ -135,6 +135,23 @@ fn matches_naive_ragged_sizes() {
 }
 
 #[test]
+fn block_size_q_not_a_multiple_of_four() {
+    // The register-blocked QK^T/PV loops (see `Kernel::dot4`/`axpy4`)
+    // process query rows in groups of 4 with a scalar-row fallback for the
+    // remainder. Every `block_size_q` used elsewhere in this file happens
+    // to be a multiple of 4, so a full (non-final) query block never hits
+    // that remainder path there — these values (3, 5, 6, 7) make *every*
+    // full block hit it, exercising 3, 1, 2, and 3 leftover rows
+    // respectively (mod 4).
+    for variant in ALL_VARIANTS {
+        for &br in &[3usize, 5, 6, 7] {
+            run_case(variant, 23, 29, 24, br, 12, false);
+            run_case(variant, 23, 29, 24, br, 12, true);
+        }
+    }
+}
+
+#[test]
 fn matches_naive_causal() {
     for variant in ALL_VARIANTS {
         run_case(variant, 64, 64, 64, 32, 32, true);

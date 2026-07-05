@@ -63,9 +63,21 @@ explicit versions.
 
 **SIMD.** Four accelerated kernels plus a portable fallback, all implementing
 the same small [`Kernel`](src/kernel.rs) trait (dot product, axpy, in-place
-scale, max/sum reduction, a vectorized `exp`) so each variant's tiling
+scale, max/sum reduction, a fused subtract+`exp`) so each variant's tiling
 algorithm (`src/v1.rs`, `src/v2.rs`, `src/v3.rs`) is written once, generic
 over whichever kernel gets selected:
+
+**Register-blocked micro-kernel.** The naive way to call `dot`/`axpy` is once
+per `(query_row, key_row)` pair — for a fixed query row, the whole `K`/`V`
+tile gets re-scanned from scratch, with zero register reuse across query
+rows. `Kernel::dot4`/`Kernel::axpy4` process 4 query rows at once, sharing
+each streamed `K`/`V` row's vector loads across four independent FMA
+accumulator chains (a BLIS/OpenBLAS-style register-blocking trick), which
+raises the compute-to-load ratio and was measured to give a real 1.3-1.7x
+speedup in isolation (see Benchmarks). The QK^T and PV loops in `v1.rs`/
+`v2.rs`/`v3.rs` process query rows in groups of 4 through `dot4`/`axpy4`,
+with a scalar-row fallback (plain `dot`/`axpy`) for the `block_size_q % 4`
+remainder.
 
 | Kernel | File | Target | Lanes | Selection |
 |---|---|---|---|---|
@@ -137,16 +149,20 @@ three implement the same mathematical operation, they must agree with each
 other, not just with the oracle independently (loose tolerance for v1,
 which accumulates slightly more floating-point rounding from its extra
 per-step normalize/denormalize round-trip; a tight tolerance between v2 and
-v3, whose arithmetic is byte-for-byte identical per row). `src/v1.rs`,
-`src/v2.rs`, and `src/v3.rs` each additionally have internal tests that
-call the scalar, AVX2, AVX-512F, NEON, and SIMD128 kernels directly
-(bypassing dispatch), so every path is checked regardless of which one a
-given host would auto-select; `v3` also has boundary-case tests for its
-pipeline running zero, one, and multiple steady-state iterations.
+v3, whose arithmetic is byte-for-byte identical per row), plus a
+`block_size_q_not_a_multiple_of_four` test specifically exercising the
+register-blocked micro-kernel's scalar-row remainder path (1, 2, and 3
+leftover rows) with `block_size_q` values that aren't multiples of 4.
+`src/v1.rs`, `src/v2.rs`, and `src/v3.rs` each additionally have internal
+tests that call the scalar, AVX2, AVX-512F, NEON, and SIMD128 kernels
+directly (bypassing dispatch), so every path is checked regardless of which
+one a given host would auto-select; `v3` also has boundary-case tests for
+its pipeline running zero, one, and multiple steady-state iterations.
 `src/avx2.rs`, `src/avx512.rs`, `src/neon.rs`, and `src/simd128.rs` each
 have their own kernel-level tests too (`exp_matches_std`,
 `dot_matches_scalar`, `reductions_match_scalar`,
-`axpy_and_scale_match_scalar`). 33 tests total (23 unit + 9 integration + 1
+`axpy_and_scale_match_scalar`, `dot4_matches_four_dots`,
+`axpy4_matches_four_axpys`). 36 tests total (25 unit + 10 integration + 1
 doctest), all passing on this machine (aarch64 — the AVX2/AVX-512-specific
 tests are `#[cfg(target_arch = "x86_64")]`-gated and don't run here).
 
@@ -170,55 +186,81 @@ Correctness above for how that's verified). Reproduce with
 kernel will engage instead on x86_64 hardware, with its own numbers.
 `d_head=64` unless noted; times in ms.
 
+These numbers reflect a register-blocked micro-kernel pass (`Kernel::dot4`/
+`axpy4`, see Design above) plus a Rayon `for_each_init` buffer-reuse pass and
+a fused subtract+`exp` softmax step — replacing an earlier, unblocked
+baseline. The `cargo bench` (Criterion) suite recorded this transition
+directly as a same-hardware before/after (not shown here — see the "Honest
+reading" bullets below for the measured deltas).
+
 **Single-threaded** (`RAYON_NUM_THREADS=1`, isolating algorithmic/SIMD
 differences from Rayon's parallelism):
 
 | seq_len | naive | v1 | v2 | v3 | v1 causal | v2 causal | v3 causal |
 |--------:|------:|---:|---:|---:|----------:|----------:|----------:|
-|  256 |  1.58 |  0.87 |  0.78 |  0.74 |  0.70 |  0.52 |  0.52 |
-|  512 |  3.85 |  2.34 |  2.50 |  2.49 |  2.54 |  1.58 |  1.59 |
-| 1024 | 15.91 | 10.28 | 10.42 | 10.26 | 10.65 |  5.49 |  5.73 |
-| 2048 | 63.51 | 40.96 | 42.29 | 41.69 | 44.09 | 22.17 | 22.16 |
-| 1024 (d=128) | 37.16 | 16.52 | 16.65 | 16.24 | 16.89 |  9.27 |  9.06 |
+|  256 |  1.60 |  0.48 |  0.45 |  0.43 |  0.44 |  0.32 |  0.31 |
+|  512 |  4.03 |  1.37 |  1.38 |  1.36 |  1.47 |  0.88 |  0.87 |
+| 1024 | 15.82 |  5.42 |  5.48 |  5.53 |  5.74 |  3.11 |  3.06 |
+| 2048 | 63.72 | 22.36 | 22.44 | 21.78 | 23.60 | 12.13 | 11.77 |
+| 1024 (d=128) | 37.37 | 10.86 | 10.56 | 10.71 | 11.01 |  6.02 |  6.07 |
 
 **Default** (Rayon parallelism active across query blocks, all 10 cores):
 
 | seq_len | naive | v1 | v2 | v3 | v1 causal | v2 causal | v3 causal |
 |--------:|------:|---:|---:|---:|----------:|----------:|----------:|
-|  256 |  2.57 | 0.34 | 0.33 | 0.32 | 0.31 | 0.26 | 0.27 |
-|  512 |  4.39 | 0.71 | 0.71 | 0.67 | 0.71 | 0.56 | 0.57 |
-| 1024 | 18.98 | 2.32 | 2.31 | 2.27 | 2.35 | 1.41 | 1.30 |
-| 2048 | 67.99 | 7.97 | 8.25 | 7.58 | 8.06 | 4.52 | 4.34 |
-| 1024 (d=128) | 42.65 | 3.52 | 3.69 | 3.82 | 3.99 | 2.23 | 2.26 |
+|  256 |  2.44 | 0.21 | 0.21 | 0.19 | 0.20 | 0.18 | 0.18 |
+|  512 |  4.55 | 0.46 | 0.46 | 0.48 | 0.49 | 0.34 | 0.38 |
+| 1024 | 18.99 | 1.40 | 1.46 | 1.37 | 1.42 | 0.85 | 0.80 |
+| 2048 | 75.01 | 4.88 | 4.85 | 4.75 | 5.11 | 2.83 | 2.69 |
+| 1024 (d=128) | 46.60 | 2.76 | 2.71 | 2.36 | 2.54 | 1.43 | 1.45 |
 
-Cross-checked against `cargo bench` (Criterion, default threading), which
-agreed with the tables above to within measurement noise at every point.
+Cross-checked against `cargo bench` (Criterion, default threading) as a
+direct before/after on the same benchmark IDs: every `flash`/`v1`/`v3`
+case (causal and non-causal, `seq_len` 128-2048) came back **-29% to -47%
+time** ("Performance has improved", `p < 0.05`) versus the pre-optimization
+baseline, while `naive` was flat (within ±1%, `p`-significant but
+practically noise) — exactly the pattern expected, since `naive_attention`
+doesn't use the `Kernel` trait and so isn't touched by any of this work.
 
 **Honest reading of these numbers, on this hardware:**
 
-- **Non-causal, tiling now gives a real win over naive** — roughly 1.5x
-  single-threaded, growing to ~8-9x at the default thread count (Rayon
-  parallelism is multiplicative on top). This is the NEON kernel actually
-  engaging on the tiled `Q`/`K`/`V` blocks; `naive_attention` doesn't use
-  the `Kernel` trait at all (it's a plain scalar oracle, only
-  autovectorized incidentally by LLVM), so it doesn't get the same SIMD
-  benefit — part of why the gap is large.
+- **Non-causal, tiling now gives a real win over naive** — roughly 2.9-3.5x
+  single-threaded (up from ~1.5x before this round of optimization),
+  growing to ~15x at the default thread count. This is the register-blocked
+  NEON kernel actually engaging on the tiled `Q`/`K`/`V` blocks;
+  `naive_attention` doesn't use the `Kernel` trait at all (it's a plain
+  scalar oracle, only autovectorized incidentally by LLVM), so it doesn't
+  get the same SIMD benefit — part of why the gap is large, and why it grew
+  further with the micro-kernel change.
 - **Causal, v2/v3 add a further ~1.8-2x on top of v1/non-causal** — from
   skipping whole future KV tiles instead of computing and masking them.
   This is the one asymptotic, unambiguous improvement in this whole
   comparison, and it shows up consistently at every size and thread count,
-  compounding with the SIMD win above rather than replacing it.
-- **v3 vs v2 is still a wash on this hardware**, same as it was on the
-  scalar-only measurements before NEON existed — sometimes marginally
-  faster, sometimes marginally slower, never by more than noise. This
+  compounding with the SIMD/micro-kernel win above rather than replacing it.
+- **v3 vs v2 is still a wash on this hardware**, same as it was before the
+  register-blocked micro-kernel existed — sometimes marginally faster,
+  sometimes marginally slower, never by more than a few percent. This
   matches the caveat in the Design section above: v3's software pipelining
   is a program-order hint for the compiler/out-of-order engine, not a
   hardware guarantee of overlap, and this CPU's out-of-order window may
   already extract most of what v2's simpler code has to offer. Don't take
   v3 on faith — measure it on your own target hardware.
 - Rayon parallelism (default vs. single-threaded columns) gives roughly a
-  5x multiplicative speedup at `seq_len=2048` on this 10-core machine,
-  independent of and on top of the algorithmic/SIMD differences above.
+  4.5x multiplicative speedup at `seq_len=2048` on this 10-core machine,
+  independent of and on top of the algorithmic/SIMD/micro-kernel
+  differences above.
+- **Where this round of work actually came from**: profiling ruled out
+  per-block heap allocation (~0.24% of per-block compute time at the
+  default tile shape) and Rayon dispatch overhead (~76-124ns/call) as
+  meaningful bottlenecks — both were fixed cheaply anyway (`for_each_init`
+  buffer reuse, a fused subtract+`exp` pass) but neither was the main
+  lever. The real win was the register-blocked `dot4`/`axpy4` micro-kernel:
+  an isolated NEON micro-benchmark measured 1.74x (`d_head=64`) and 1.29x
+  (`d_head=128`) for 4-query-row-blocked QK^T/PV versus the previous
+  one-row-at-a-time pattern, before it was wired into `v1`/`v2`/`v3` — the
+  tables above show that validated prediction compounding with the Tier-1
+  fixes into the full ~1.9-2x single-threaded improvement measured
+  end-to-end.
 
 **Note on the causal speedup**: it comes from skipping whole `K`/`V` tiles
 (v2/v3 only), so it scales with how many tiles are actually skippable — at
@@ -303,11 +345,12 @@ Deliberately out of scope for this pass, but the architecture leaves room:
   etc.): `avx512.rs` only uses the baseline `avx512f`. VNNI in particular
   targets int8 dot-product acceleration, which would only matter alongside
   the lower-precision work below.
-- **Register-blocked micro-kernel**: the QK^T and PV steps currently do one
-  SIMD dot-product / axpy per `(i, j)` pair. A proper packed micro-kernel
-  (BLIS/OpenBLAS-style register tiling, reusing loaded `Q`/`V` rows across
-  multiple output columns) would improve on this, at real implementation
-  complexity cost.
+- ~~**Register-blocked micro-kernel**~~ — implemented (`Kernel::dot4`/
+  `axpy4`, wired into the QK^T/PV loops in `src/v1.rs`/`src/v2.rs`/
+  `src/v3.rs`); see Design and Benchmarks above for what it measures as.
+  A further step not yet done: real packed BLIS/OpenBLAS-style tiling
+  (blocking the *key/value* dimension too, not just query rows) would
+  improve on this further, at real implementation complexity cost.
 - **Lower precision** (`bf16`/`f16`/FP8): halves (or quarters) memory
   bandwidth, which is often the actual bottleneck at long sequence lengths,
   and is part of FlashAttention-3's actual numerics story (incoherent

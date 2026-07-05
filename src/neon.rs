@@ -29,13 +29,23 @@ impl Kernel for NeonKernel {
     }
 
     #[inline]
-    unsafe fn exp_inplace(x: &mut [f32]) {
-        exp_inplace_neon(x)
+    unsafe fn dot4(a0: &[f32], a1: &[f32], a2: &[f32], a3: &[f32], b: &[f32]) -> [f32; 4] {
+        dot4_neon(a0, a1, a2, a3, b)
+    }
+
+    #[inline]
+    unsafe fn sub_exp_inplace(x: &mut [f32], m: f32) {
+        sub_exp_inplace_neon(x, m)
     }
 
     #[inline]
     unsafe fn axpy(dst: &mut [f32], src: &[f32], scale: f32) {
         axpy_neon(dst, src, scale)
+    }
+
+    #[inline]
+    unsafe fn axpy4(dst: [&mut [f32]; 4], b: &[f32], scale: [f32; 4]) {
+        axpy4_neon(dst, b, scale)
     }
 
     #[inline]
@@ -85,6 +95,45 @@ unsafe fn dot_neon(a: &[f32], b: &[f32]) -> f32 {
         i += 1;
     }
     sum
+}
+
+/// Four dot products sharing `b`'s vector loads across four independent FMA
+/// accumulator chains — see [`crate::kernel::Kernel::dot4`] for why this is
+/// faster than four separate [`dot_neon`] calls.
+#[target_feature(enable = "neon")]
+unsafe fn dot4_neon(a0: &[f32], a1: &[f32], a2: &[f32], a3: &[f32], b: &[f32]) -> [f32; 4] {
+    debug_assert_eq!(a0.len(), b.len());
+    debug_assert_eq!(a1.len(), b.len());
+    debug_assert_eq!(a2.len(), b.len());
+    debug_assert_eq!(a3.len(), b.len());
+    let len = b.len();
+    let mut acc0 = vdupq_n_f32(0.0);
+    let mut acc1 = vdupq_n_f32(0.0);
+    let mut acc2 = vdupq_n_f32(0.0);
+    let mut acc3 = vdupq_n_f32(0.0);
+    let mut i = 0usize;
+    while i + 4 <= len {
+        let bv = vld1q_f32(b.as_ptr().add(i)); // loaded once, shared 4 ways
+        acc0 = vfmaq_f32(acc0, vld1q_f32(a0.as_ptr().add(i)), bv);
+        acc1 = vfmaq_f32(acc1, vld1q_f32(a1.as_ptr().add(i)), bv);
+        acc2 = vfmaq_f32(acc2, vld1q_f32(a2.as_ptr().add(i)), bv);
+        acc3 = vfmaq_f32(acc3, vld1q_f32(a3.as_ptr().add(i)), bv);
+        i += 4;
+    }
+    let mut sums = [
+        vaddvq_f32(acc0),
+        vaddvq_f32(acc1),
+        vaddvq_f32(acc2),
+        vaddvq_f32(acc3),
+    ];
+    while i < len {
+        sums[0] += a0[i] * b[i];
+        sums[1] += a1[i] * b[i];
+        sums[2] += a2[i] * b[i];
+        sums[3] += a3[i] * b[i];
+        i += 1;
+    }
+    sums
 }
 
 /// Vectorized exp over 4 lanes. See module docs for the algorithm.
@@ -143,18 +192,22 @@ unsafe fn exp128_ps(x: float32x4_t) -> float32x4_t {
     vmulq_f32(y, pow2n)
 }
 
+/// Fused `x[i] = exp(x[i] - m)`: subtract and exponential in the same pass
+/// over `x` (one load/store per lane instead of two separate passes).
 #[target_feature(enable = "neon")]
-unsafe fn exp_inplace_neon(x: &mut [f32]) {
+unsafe fn sub_exp_inplace_neon(x: &mut [f32], m: f32) {
     let len = x.len();
+    let vm = vdupq_n_f32(m);
     let mut i = 0usize;
     while i + 4 <= len {
         let v = vld1q_f32(x.as_ptr().add(i));
+        let v = vsubq_f32(v, vm);
         let r = exp128_ps(v);
         vst1q_f32(x.as_mut_ptr().add(i), r);
         i += 4;
     }
     while i < len {
-        x[i] = x[i].exp();
+        x[i] = (x[i] - m).exp();
         i += 1;
     }
 }
@@ -174,6 +227,42 @@ unsafe fn axpy_neon(dst: &mut [f32], src: &[f32], scale: f32) {
     }
     while i < len {
         dst[i] += src[i] * scale;
+        i += 1;
+    }
+}
+
+/// Four `axpy`s sharing `b`'s vector loads across four destination rows —
+/// see [`crate::kernel::Kernel::axpy4`].
+#[target_feature(enable = "neon")]
+unsafe fn axpy4_neon(dst: [&mut [f32]; 4], b: &[f32], scale: [f32; 4]) {
+    let [d0, d1, d2, d3] = dst;
+    debug_assert_eq!(d0.len(), b.len());
+    debug_assert_eq!(d1.len(), b.len());
+    debug_assert_eq!(d2.len(), b.len());
+    debug_assert_eq!(d3.len(), b.len());
+    let len = b.len();
+    let vs0 = vdupq_n_f32(scale[0]);
+    let vs1 = vdupq_n_f32(scale[1]);
+    let vs2 = vdupq_n_f32(scale[2]);
+    let vs3 = vdupq_n_f32(scale[3]);
+    let mut i = 0usize;
+    while i + 4 <= len {
+        let bv = vld1q_f32(b.as_ptr().add(i)); // loaded once, shared 4 ways
+        let r0 = vfmaq_f32(vld1q_f32(d0.as_ptr().add(i)), bv, vs0);
+        vst1q_f32(d0.as_mut_ptr().add(i), r0);
+        let r1 = vfmaq_f32(vld1q_f32(d1.as_ptr().add(i)), bv, vs1);
+        vst1q_f32(d1.as_mut_ptr().add(i), r1);
+        let r2 = vfmaq_f32(vld1q_f32(d2.as_ptr().add(i)), bv, vs2);
+        vst1q_f32(d2.as_mut_ptr().add(i), r2);
+        let r3 = vfmaq_f32(vld1q_f32(d3.as_ptr().add(i)), bv, vs3);
+        vst1q_f32(d3.as_mut_ptr().add(i), r3);
+        i += 4;
+    }
+    while i < len {
+        d0[i] += b[i] * scale[0];
+        d1[i] += b[i] * scale[1];
+        d2[i] += b[i] * scale[2];
+        d3[i] += b[i] * scale[3];
         i += 1;
     }
 }
@@ -242,7 +331,7 @@ mod tests {
     fn exp_matches_std() {
         let xs: Vec<f32> = (-800..800).map(|i| i as f32 * 0.1).collect();
         let mut got = xs.clone();
-        unsafe { exp_inplace_neon(&mut got) };
+        unsafe { sub_exp_inplace_neon(&mut got, 0.0) };
         let mut max_rel_err = 0.0f32;
         for (x, g) in xs.iter().zip(got.iter()) {
             let want = x.exp();
@@ -269,6 +358,65 @@ mod tests {
                 (scalar - simd).abs() < 1e-3 * (scalar.abs() + 1.0),
                 "len={len} scalar={scalar} simd={simd}"
             );
+        }
+    }
+
+    #[test]
+    fn dot4_matches_four_dots() {
+        for len in [0usize, 1, 3, 4, 5, 7, 8, 9, 33] {
+            let mk =
+                |seed: f32| -> Vec<f32> { (0..len).map(|i| (i as f32 * seed).sin()).collect() };
+            let a0 = mk(0.11);
+            let a1 = mk(0.23);
+            let a2 = mk(0.37);
+            let a3 = mk(0.51);
+            let b = mk(0.71);
+
+            let want = [
+                unsafe { dot_neon(&a0, &b) },
+                unsafe { dot_neon(&a1, &b) },
+                unsafe { dot_neon(&a2, &b) },
+                unsafe { dot_neon(&a3, &b) },
+            ];
+            let got = unsafe { dot4_neon(&a0, &a1, &a2, &a3, &b) };
+            for k in 0..4 {
+                assert!(
+                    (want[k] - got[k]).abs() < 1e-3 * (want[k].abs() + 1.0),
+                    "len={len} k={k} want={} got={}",
+                    want[k],
+                    got[k]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn axpy4_matches_four_axpys() {
+        for len in [0usize, 1, 3, 4, 5, 7, 8, 9, 33] {
+            let mk =
+                |seed: f32| -> Vec<f32> { (0..len).map(|i| (i as f32 * seed).cos()).collect() };
+            let b = mk(0.71);
+            let scale = [1.1f32, -2.2, 0.0, 3.3];
+
+            let mut want = [mk(0.11), mk(0.23), mk(0.37), mk(0.51)];
+            for (row, &s) in want.iter_mut().zip(scale.iter()) {
+                unsafe { axpy_neon(row, &b, s) };
+            }
+
+            let mut got = [mk(0.11), mk(0.23), mk(0.37), mk(0.51)];
+            let [g0, g1, g2, g3] = &mut got;
+            unsafe { axpy4_neon([g0, g1, g2, g3], &b, scale) };
+
+            for k in 0..4 {
+                for i in 0..len {
+                    assert!(
+                        (want[k][i] - got[k][i]).abs() < 1e-4,
+                        "len={len} k={k} i={i} want={} got={}",
+                        want[k][i],
+                        got[k][i]
+                    );
+                }
+            }
         }
     }
 

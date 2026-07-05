@@ -137,9 +137,22 @@ fn run_v1<K: Kernel + Sync>(
     let br = config.block_size_q.max(1).min(seq_len_q);
     let bc = config.block_size_kv.max(1).min(seq_len_k);
 
-    out.par_chunks_mut(br * d_head)
-        .enumerate()
-        .for_each(|(qi, out_block)| {
+    out.par_chunks_mut(br * d_head).enumerate().for_each_init(
+        // Rayon calls this once per work-stealing split rather than
+        // once per query block, so scratch buffers get reused across
+        // (typically many) blocks handled by the same split instead of
+        // being freshly heap-allocated for every single one. Sized to
+        // the configured `br`/`bc` (the max any block can be); each
+        // call below slices down to that call's actual `this_br`.
+        || {
+            (
+                vec![f32::NEG_INFINITY; br],
+                vec![0.0f32; br],
+                vec![0.0f32; br * d_head],
+                vec![0.0f32; br * bc],
+            )
+        },
+        |(m_buf, l_buf, acc_buf, scores_buf), (qi, out_block)| {
             let q_start = qi * br;
             let this_br = out_block.len() / d_head;
             let q_block = &q[q_start * d_head..(q_start + this_br) * d_head];
@@ -148,10 +161,12 @@ fn run_v1<K: Kernel + Sync>(
             // v2, `acc` is kept *normalized* between kv-block steps (it's
             // written back in a consistent state after every step, mirroring
             // the original paper's HBM round-trip), not deferred.
-            let mut m = vec![f32::NEG_INFINITY; this_br]; // running row max
-            let mut l = vec![0.0f32; this_br]; // running row sum (of exp)
-            let mut acc = vec![0.0f32; this_br * d_head]; // normalized output, updated every step
-            let mut scores = vec![0.0f32; this_br * bc]; // scratch S tile, reused per kv-block
+            let m = &mut m_buf[..this_br]; // running row max
+            let l = &mut l_buf[..this_br]; // running row sum (of exp)
+            let acc = &mut acc_buf[..this_br * d_head]; // normalized output, updated every step
+            m.fill(f32::NEG_INFINITY);
+            l.fill(0.0);
+            acc.fill(0.0);
 
             let num_kv_blocks = seq_len_k.div_ceil(bc);
             for kj in 0..num_kv_blocks {
@@ -165,15 +180,33 @@ fn run_v1<K: Kernel + Sync>(
 
                 let k_block = &k[k_start * d_head..(k_start + this_bc) * d_head];
                 let v_block = &v[k_start * d_head..(k_start + this_bc) * d_head];
-                let scores_slice = &mut scores[..this_br * this_bc];
+                let scores_slice = &mut scores_buf[..this_br * this_bc];
 
-                // S_ij = scale * Q_i . K_j
-                for i in 0..this_br {
+                // S_ij = scale * Q_i . K_j. Blocked 4 query rows at a time
+                // — see `v2.rs`'s identical QK^T loop / `Kernel::dot4`'s
+                // docs for why.
+                let mut i = 0;
+                while i + 4 <= this_br {
+                    let q0 = &q_block[i * d_head..(i + 1) * d_head];
+                    let q1 = &q_block[(i + 1) * d_head..(i + 2) * d_head];
+                    let q2 = &q_block[(i + 2) * d_head..(i + 3) * d_head];
+                    let q3 = &q_block[(i + 3) * d_head..(i + 4) * d_head];
+                    for (j, kj_row) in k_block.chunks_exact(d_head).enumerate() {
+                        let [s0, s1, s2, s3] = unsafe { K::dot4(q0, q1, q2, q3, kj_row) };
+                        scores_slice[i * this_bc + j] = s0 * scale;
+                        scores_slice[(i + 1) * this_bc + j] = s1 * scale;
+                        scores_slice[(i + 2) * this_bc + j] = s2 * scale;
+                        scores_slice[(i + 3) * this_bc + j] = s3 * scale;
+                    }
+                    i += 4;
+                }
+                while i < this_br {
                     let qi_row = &q_block[i * d_head..(i + 1) * d_head];
                     let s_row = &mut scores_slice[i * this_bc..(i + 1) * this_bc];
                     for (s, kj_row) in s_row.iter_mut().zip(k_block.chunks_exact(d_head)) {
                         *s = unsafe { K::dot(qi_row, kj_row) } * scale;
                     }
+                    i += 1;
                 }
 
                 if config.causal {
@@ -188,17 +221,19 @@ fn run_v1<K: Kernel + Sync>(
                     }
                 }
 
-                // Online softmax update, fused with the per-step
-                // normalize/denormalize round-trip and PV accumulation.
+                // Online softmax update + per-step un-normalize round-trip,
+                // per row (the running m/l/acc-scale state is a genuine
+                // per-row sequential dependency) — but leaves the PV
+                // accumulation to the blocked pass below, and the
+                // re-normalize-by-new_l step to the pass after that, since
+                // neither depends on *other* rows, only this row's own
+                // already-finished state here.
                 for i in 0..this_br {
                     let s_row = &mut scores_slice[i * this_bc..(i + 1) * this_bc];
                     let block_max = unsafe { K::max_reduce(s_row) };
                     let new_m = m[i].max(block_max);
 
-                    for x in s_row.iter_mut() {
-                        *x -= new_m;
-                    }
-                    unsafe { K::exp_inplace(s_row) };
+                    unsafe { K::sub_exp_inplace(s_row, new_m) };
 
                     let block_sum = unsafe { K::sum_reduce(s_row) };
                     let correction = (m[i] - new_m).exp();
@@ -212,17 +247,49 @@ fn run_v1<K: Kernel + Sync>(
                     // one fused scale — this is the extra work v2 defers.
                     unsafe { K::scale_inplace(acc_row, old_l * correction) };
 
+                    m[i] = new_m;
+                    l[i] = new_l;
+                }
+
+                // PV accumulation, 4 rows at a time — see `v2.rs`'s
+                // identical PV loop / `Kernel::axpy4`'s docs for why.
+                let mut i = 0;
+                while i + 4 <= this_br {
+                    let mut chunks = acc[i * d_head..(i + 4) * d_head].chunks_exact_mut(d_head);
+                    let d0 = chunks.next().unwrap();
+                    let d1 = chunks.next().unwrap();
+                    let d2 = chunks.next().unwrap();
+                    let d3 = chunks.next().unwrap();
+
+                    let p0 = &scores_slice[i * this_bc..(i + 1) * this_bc];
+                    let p1 = &scores_slice[(i + 1) * this_bc..(i + 2) * this_bc];
+                    let p2 = &scores_slice[(i + 2) * this_bc..(i + 3) * this_bc];
+                    let p3 = &scores_slice[(i + 3) * this_bc..(i + 4) * this_bc];
+
+                    for (j, v_row) in v_block.chunks_exact(d_head).enumerate() {
+                        let scale4 = [p0[j], p1[j], p2[j], p3[j]];
+                        unsafe {
+                            K::axpy4([&mut *d0, &mut *d1, &mut *d2, &mut *d3], v_row, scale4)
+                        };
+                    }
+                    i += 4;
+                }
+                while i < this_br {
+                    let s_row = &scores_slice[i * this_bc..(i + 1) * this_bc];
+                    let acc_row = &mut acc[i * d_head..(i + 1) * d_head];
                     for (v_row, &p) in v_block.chunks_exact(d_head).zip(s_row.iter()) {
                         unsafe { K::axpy(acc_row, v_row, p) };
                     }
+                    i += 1;
+                }
 
-                    // Re-normalize immediately, so `acc` is consistent
-                    // (normalized) again before the next kv-block step.
-                    let inv_new_l = if new_l > 0.0 { 1.0 / new_l } else { 0.0 };
+                // Re-normalize by this step's new sum — `l[i]` already
+                // holds it (updated above), so `acc` is consistent again
+                // before the next kv-block step, matching v1's algorithm.
+                for i in 0..this_br {
+                    let inv_new_l = if l[i] > 0.0 { 1.0 / l[i] } else { 0.0 };
+                    let acc_row = &mut acc[i * d_head..(i + 1) * d_head];
                     unsafe { K::scale_inplace(acc_row, inv_new_l) };
-
-                    m[i] = new_m;
-                    l[i] = new_l;
                 }
             }
 
@@ -232,7 +299,8 @@ fn run_v1<K: Kernel + Sync>(
                 let out_row = &mut out_block[i * d_head..(i + 1) * d_head];
                 out_row.copy_from_slice(acc_row);
             }
-        });
+        },
+    );
 }
 
 #[cfg(test)]

@@ -38,13 +38,23 @@ impl Kernel for Simd128Kernel {
     }
 
     #[inline]
-    unsafe fn exp_inplace(x: &mut [f32]) {
-        exp_inplace_simd128(x)
+    unsafe fn dot4(a0: &[f32], a1: &[f32], a2: &[f32], a3: &[f32], b: &[f32]) -> [f32; 4] {
+        dot4_simd128(a0, a1, a2, a3, b)
+    }
+
+    #[inline]
+    unsafe fn sub_exp_inplace(x: &mut [f32], m: f32) {
+        sub_exp_inplace_simd128(x, m)
     }
 
     #[inline]
     unsafe fn axpy(dst: &mut [f32], src: &[f32], scale: f32) {
         axpy_simd128(dst, src, scale)
+    }
+
+    #[inline]
+    unsafe fn axpy4(dst: [&mut [f32]; 4], b: &[f32], scale: [f32; 4]) {
+        axpy4_simd128(dst, b, scale)
     }
 
     #[inline]
@@ -114,6 +124,57 @@ unsafe fn dot_simd128(a: &[f32], b: &[f32]) -> f32 {
     sum
 }
 
+/// Four dot products sharing `b`'s vector loads across four independent
+/// mul+add accumulator chains — see [`crate::kernel::Kernel::dot4`] for why
+/// this is faster than four separate [`dot_simd128`] calls.
+#[target_feature(enable = "simd128")]
+unsafe fn dot4_simd128(a0: &[f32], a1: &[f32], a2: &[f32], a3: &[f32], b: &[f32]) -> [f32; 4] {
+    debug_assert_eq!(a0.len(), b.len());
+    debug_assert_eq!(a1.len(), b.len());
+    debug_assert_eq!(a2.len(), b.len());
+    debug_assert_eq!(a3.len(), b.len());
+    let len = b.len();
+    let mut acc0 = f32x4_splat(0.0);
+    let mut acc1 = f32x4_splat(0.0);
+    let mut acc2 = f32x4_splat(0.0);
+    let mut acc3 = f32x4_splat(0.0);
+    let mut i = 0usize;
+    while i + 4 <= len {
+        let bv = v128_load(b.as_ptr().add(i) as *const v128); // loaded once, shared 4 ways
+        acc0 = f32x4_add(
+            acc0,
+            f32x4_mul(v128_load(a0.as_ptr().add(i) as *const v128), bv),
+        );
+        acc1 = f32x4_add(
+            acc1,
+            f32x4_mul(v128_load(a1.as_ptr().add(i) as *const v128), bv),
+        );
+        acc2 = f32x4_add(
+            acc2,
+            f32x4_mul(v128_load(a2.as_ptr().add(i) as *const v128), bv),
+        );
+        acc3 = f32x4_add(
+            acc3,
+            f32x4_mul(v128_load(a3.as_ptr().add(i) as *const v128), bv),
+        );
+        i += 4;
+    }
+    let mut sums = [
+        hsum128_ps(acc0),
+        hsum128_ps(acc1),
+        hsum128_ps(acc2),
+        hsum128_ps(acc3),
+    ];
+    while i < len {
+        sums[0] += a0[i] * b[i];
+        sums[1] += a1[i] * b[i];
+        sums[2] += a2[i] * b[i];
+        sums[3] += a3[i] * b[i];
+        i += 1;
+    }
+    sums
+}
+
 /// Vectorized exp over 4 lanes. See module docs for the algorithm.
 ///
 /// The polynomial coefficients below are the same published Cephes-derived
@@ -171,18 +232,22 @@ unsafe fn exp128_ps(x: v128) -> v128 {
     f32x4_mul(y, pow2n)
 }
 
+/// Fused `x[i] = exp(x[i] - m)`: subtract and exponential in the same pass
+/// over `x` (one load/store per lane instead of two separate passes).
 #[target_feature(enable = "simd128")]
-unsafe fn exp_inplace_simd128(x: &mut [f32]) {
+unsafe fn sub_exp_inplace_simd128(x: &mut [f32], m: f32) {
     let len = x.len();
+    let vm = f32x4_splat(m);
     let mut i = 0usize;
     while i + 4 <= len {
         let v = v128_load(x.as_ptr().add(i) as *const v128);
+        let v = f32x4_sub(v, vm);
         let r = exp128_ps(v);
         v128_store(x.as_mut_ptr().add(i) as *mut v128, r);
         i += 4;
     }
     while i < len {
-        x[i] = x[i].exp();
+        x[i] = (x[i] - m).exp();
         i += 1;
     }
 }
@@ -202,6 +267,54 @@ unsafe fn axpy_simd128(dst: &mut [f32], src: &[f32], scale: f32) {
     }
     while i < len {
         dst[i] += src[i] * scale;
+        i += 1;
+    }
+}
+
+/// Four `axpy`s sharing `b`'s vector loads across four destination rows —
+/// see [`crate::kernel::Kernel::axpy4`].
+#[target_feature(enable = "simd128")]
+unsafe fn axpy4_simd128(dst: [&mut [f32]; 4], b: &[f32], scale: [f32; 4]) {
+    let [d0, d1, d2, d3] = dst;
+    debug_assert_eq!(d0.len(), b.len());
+    debug_assert_eq!(d1.len(), b.len());
+    debug_assert_eq!(d2.len(), b.len());
+    debug_assert_eq!(d3.len(), b.len());
+    let len = b.len();
+    let vs0 = f32x4_splat(scale[0]);
+    let vs1 = f32x4_splat(scale[1]);
+    let vs2 = f32x4_splat(scale[2]);
+    let vs3 = f32x4_splat(scale[3]);
+    let mut i = 0usize;
+    while i + 4 <= len {
+        let bv = v128_load(b.as_ptr().add(i) as *const v128); // loaded once, shared 4 ways
+        let r0 = f32x4_add(
+            v128_load(d0.as_ptr().add(i) as *const v128),
+            f32x4_mul(bv, vs0),
+        );
+        v128_store(d0.as_mut_ptr().add(i) as *mut v128, r0);
+        let r1 = f32x4_add(
+            v128_load(d1.as_ptr().add(i) as *const v128),
+            f32x4_mul(bv, vs1),
+        );
+        v128_store(d1.as_mut_ptr().add(i) as *mut v128, r1);
+        let r2 = f32x4_add(
+            v128_load(d2.as_ptr().add(i) as *const v128),
+            f32x4_mul(bv, vs2),
+        );
+        v128_store(d2.as_mut_ptr().add(i) as *mut v128, r2);
+        let r3 = f32x4_add(
+            v128_load(d3.as_ptr().add(i) as *const v128),
+            f32x4_mul(bv, vs3),
+        );
+        v128_store(d3.as_mut_ptr().add(i) as *mut v128, r3);
+        i += 4;
+    }
+    while i < len {
+        d0[i] += b[i] * scale[0];
+        d1[i] += b[i] * scale[1];
+        d2[i] += b[i] * scale[2];
+        d3[i] += b[i] * scale[3];
         i += 1;
     }
 }
@@ -270,7 +383,7 @@ mod tests {
     fn exp_matches_std() {
         let xs: Vec<f32> = (-800..800).map(|i| i as f32 * 0.1).collect();
         let mut got = xs.clone();
-        unsafe { exp_inplace_simd128(&mut got) };
+        unsafe { sub_exp_inplace_simd128(&mut got, 0.0) };
         let mut max_rel_err = 0.0f32;
         for (x, g) in xs.iter().zip(got.iter()) {
             let want = x.exp();
@@ -297,6 +410,65 @@ mod tests {
                 (scalar - simd).abs() < 1e-3 * (scalar.abs() + 1.0),
                 "len={len} scalar={scalar} simd={simd}"
             );
+        }
+    }
+
+    #[test]
+    fn dot4_matches_four_dots() {
+        for len in [0usize, 1, 3, 4, 5, 7, 8, 9, 33] {
+            let mk =
+                |seed: f32| -> Vec<f32> { (0..len).map(|i| (i as f32 * seed).sin()).collect() };
+            let a0 = mk(0.11);
+            let a1 = mk(0.23);
+            let a2 = mk(0.37);
+            let a3 = mk(0.51);
+            let b = mk(0.71);
+
+            let want = [
+                unsafe { dot_simd128(&a0, &b) },
+                unsafe { dot_simd128(&a1, &b) },
+                unsafe { dot_simd128(&a2, &b) },
+                unsafe { dot_simd128(&a3, &b) },
+            ];
+            let got = unsafe { dot4_simd128(&a0, &a1, &a2, &a3, &b) };
+            for k in 0..4 {
+                assert!(
+                    (want[k] - got[k]).abs() < 1e-3 * (want[k].abs() + 1.0),
+                    "len={len} k={k} want={} got={}",
+                    want[k],
+                    got[k]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn axpy4_matches_four_axpys() {
+        for len in [0usize, 1, 3, 4, 5, 7, 8, 9, 33] {
+            let mk =
+                |seed: f32| -> Vec<f32> { (0..len).map(|i| (i as f32 * seed).cos()).collect() };
+            let b = mk(0.71);
+            let scale = [1.1f32, -2.2, 0.0, 3.3];
+
+            let mut want = [mk(0.11), mk(0.23), mk(0.37), mk(0.51)];
+            for (row, &s) in want.iter_mut().zip(scale.iter()) {
+                unsafe { axpy_simd128(row, &b, s) };
+            }
+
+            let mut got = [mk(0.11), mk(0.23), mk(0.37), mk(0.51)];
+            let [g0, g1, g2, g3] = &mut got;
+            unsafe { axpy4_simd128([g0, g1, g2, g3], &b, scale) };
+
+            for k in 0..4 {
+                for i in 0..len {
+                    assert!(
+                        (want[k][i] - got[k][i]).abs() < 1e-4,
+                        "len={len} k={k} i={i} want={} got={}",
+                        want[k][i],
+                        got[k][i]
+                    );
+                }
+            }
         }
     }
 
