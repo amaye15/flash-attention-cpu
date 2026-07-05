@@ -153,20 +153,38 @@ fn compute_tile<K: Kernel + Sync>(
     let k_block = &k[k_start * d_head..(k_start + this_bc) * d_head];
     let scores_slice = &mut dst[..this_br * this_bc];
 
-    // Blocked 4 query rows at a time — see `v2.rs`'s identical QK^T loop /
-    // `Kernel::dot4`'s docs for why.
+    // Three-tier register blocking — see `v2.rs`'s identical QK^T loop /
+    // `Kernel::dot4x4`'s docs for why.
     let mut i = 0;
     while i + 4 <= this_br {
         let q0 = &q_block[i * d_head..(i + 1) * d_head];
         let q1 = &q_block[(i + 1) * d_head..(i + 2) * d_head];
         let q2 = &q_block[(i + 2) * d_head..(i + 3) * d_head];
         let q3 = &q_block[(i + 3) * d_head..(i + 4) * d_head];
-        for (j, kj_row) in k_block.chunks_exact(d_head).enumerate() {
+        let qg = [q0, q1, q2, q3];
+
+        let mut j = 0;
+        while j + 4 <= this_bc {
+            let k0 = &k_block[j * d_head..(j + 1) * d_head];
+            let k1 = &k_block[(j + 1) * d_head..(j + 2) * d_head];
+            let k2 = &k_block[(j + 2) * d_head..(j + 3) * d_head];
+            let k3 = &k_block[(j + 3) * d_head..(j + 4) * d_head];
+            let s = unsafe { K::dot4x4(qg, [k0, k1, k2, k3]) };
+            for r in 0..4 {
+                for c in 0..4 {
+                    scores_slice[(i + r) * this_bc + (j + c)] = s[r][c] * scale;
+                }
+            }
+            j += 4;
+        }
+        while j < this_bc {
+            let kj_row = &k_block[j * d_head..(j + 1) * d_head];
             let [s0, s1, s2, s3] = unsafe { K::dot4(q0, q1, q2, q3, kj_row) };
             scores_slice[i * this_bc + j] = s0 * scale;
             scores_slice[(i + 1) * this_bc + j] = s1 * scale;
             scores_slice[(i + 2) * this_bc + j] = s2 * scale;
             scores_slice[(i + 3) * this_bc + j] = s3 * scale;
+            j += 1;
         }
         i += 4;
     }
@@ -221,9 +239,7 @@ fn finish_tile<K: Kernel + Sync>(
         let block_max = unsafe { K::max_reduce(s_row) };
         let new_m = m[i].max(block_max);
 
-        unsafe { K::sub_exp_inplace(s_row, new_m) };
-
-        let block_sum = unsafe { K::sum_reduce(s_row) };
+        let block_sum = unsafe { K::sub_exp_sum_inplace(s_row, new_m) };
         let correction = (m[i] - new_m).exp();
 
         l[i] = correction * l[i] + block_sum;
@@ -234,8 +250,8 @@ fn finish_tile<K: Kernel + Sync>(
         m[i] = new_m;
     }
 
-    // PV accumulation, 4 rows at a time — see `v2.rs`'s identical PV loop /
-    // `Kernel::axpy4`'s docs for why.
+    // PV accumulation, 4 rows at a time via `pv4` — see `v2.rs`'s identical
+    // PV loop / `Kernel::pv4`'s docs for why.
     let mut i = 0;
     while i + 4 <= this_br {
         let mut chunks = acc[i * d_head..(i + 4) * d_head].chunks_exact_mut(d_head);
@@ -249,10 +265,7 @@ fn finish_tile<K: Kernel + Sync>(
         let p2 = &scores[(i + 2) * this_bc..(i + 3) * this_bc];
         let p3 = &scores[(i + 3) * this_bc..(i + 4) * this_bc];
 
-        for (j, v_row) in v_block.chunks_exact(d_head).enumerate() {
-            let scale4 = [p0[j], p1[j], p2[j], p3[j]];
-            unsafe { K::axpy4([&mut *d0, &mut *d1, &mut *d2, &mut *d3], v_row, scale4) };
-        }
+        unsafe { K::pv4([d0, d1, d2, d3], v_block, [p0, p1, p2, p3]) };
         i += 4;
     }
     while i < this_br {

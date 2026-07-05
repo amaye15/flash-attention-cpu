@@ -34,8 +34,13 @@ impl Kernel for NeonKernel {
     }
 
     #[inline]
-    unsafe fn sub_exp_inplace(x: &mut [f32], m: f32) {
-        sub_exp_inplace_neon(x, m)
+    unsafe fn dot4x4(q: [&[f32]; 4], k: [&[f32]; 4]) -> [[f32; 4]; 4] {
+        dot4x4_neon(q, k)
+    }
+
+    #[inline]
+    unsafe fn sub_exp_sum_inplace(x: &mut [f32], m: f32) -> f32 {
+        sub_exp_sum_inplace_neon(x, m)
     }
 
     #[inline]
@@ -44,8 +49,8 @@ impl Kernel for NeonKernel {
     }
 
     #[inline]
-    unsafe fn axpy4(dst: [&mut [f32]; 4], b: &[f32], scale: [f32; 4]) {
-        axpy4_neon(dst, b, scale)
+    unsafe fn pv4(acc: [&mut [f32]; 4], v_block: &[f32], p: [&[f32]; 4]) {
+        pv4_neon(acc, v_block, p)
     }
 
     #[inline]
@@ -56,11 +61,6 @@ impl Kernel for NeonKernel {
     #[inline]
     unsafe fn max_reduce(x: &[f32]) -> f32 {
         max_reduce_neon(x)
-    }
-
-    #[inline]
-    unsafe fn sum_reduce(x: &[f32]) -> f32 {
-        sum_reduce_neon(x)
     }
 }
 
@@ -136,6 +136,46 @@ unsafe fn dot4_neon(a0: &[f32], a1: &[f32], a2: &[f32], a3: &[f32], b: &[f32]) -
     sums
 }
 
+/// 4 query rows x 4 key rows blocked together: both operands' vector loads
+/// are shared across all 16 independent FMA accumulator chains — see
+/// [`crate::kernel::Kernel::dot4x4`].
+#[target_feature(enable = "neon")]
+unsafe fn dot4x4_neon(q: [&[f32]; 4], k: [&[f32]; 4]) -> [[f32; 4]; 4] {
+    let d = q[0].len();
+    let mut acc = [[vdupq_n_f32(0.0); 4]; 4];
+    let mut p = 0usize;
+    while p + 4 <= d {
+        let qv = [
+            vld1q_f32(q[0].as_ptr().add(p)),
+            vld1q_f32(q[1].as_ptr().add(p)),
+            vld1q_f32(q[2].as_ptr().add(p)),
+            vld1q_f32(q[3].as_ptr().add(p)),
+        ];
+        for c in 0..4 {
+            let kv = vld1q_f32(k[c].as_ptr().add(p)); // loaded once, shared 4 ways
+            for r in 0..4 {
+                acc[r][c] = vfmaq_f32(acc[r][c], qv[r], kv);
+            }
+        }
+        p += 4;
+    }
+    let mut sums = [[0.0f32; 4]; 4];
+    for r in 0..4 {
+        for c in 0..4 {
+            sums[r][c] = vaddvq_f32(acc[r][c]);
+        }
+    }
+    while p < d {
+        for r in 0..4 {
+            for c in 0..4 {
+                sums[r][c] += q[r][p] * k[c][p];
+            }
+        }
+        p += 1;
+    }
+    sums
+}
+
 /// Vectorized exp over 4 lanes. See module docs for the algorithm.
 ///
 /// The polynomial coefficients are the same published Cephes-derived
@@ -192,24 +232,32 @@ unsafe fn exp128_ps(x: float32x4_t) -> float32x4_t {
     vmulq_f32(y, pow2n)
 }
 
-/// Fused `x[i] = exp(x[i] - m)`: subtract and exponential in the same pass
-/// over `x` (one load/store per lane instead of two separate passes).
+/// Fused `x[i] = exp(x[i] - m)`, returning `sum(x)` after the exponential:
+/// subtract, exponential, and sum accumulation all in the same pass over
+/// `x` (one load/store per lane, plus the sum, instead of two separate
+/// passes).
 #[target_feature(enable = "neon")]
-unsafe fn sub_exp_inplace_neon(x: &mut [f32], m: f32) {
+unsafe fn sub_exp_sum_inplace_neon(x: &mut [f32], m: f32) -> f32 {
     let len = x.len();
     let vm = vdupq_n_f32(m);
+    let mut sum_acc = vdupq_n_f32(0.0);
     let mut i = 0usize;
     while i + 4 <= len {
         let v = vld1q_f32(x.as_ptr().add(i));
         let v = vsubq_f32(v, vm);
         let r = exp128_ps(v);
         vst1q_f32(x.as_mut_ptr().add(i), r);
+        sum_acc = vaddq_f32(sum_acc, r);
         i += 4;
     }
+    let mut sum = vaddvq_f32(sum_acc);
     while i < len {
-        x[i] = (x[i] - m).exp();
+        let e = (x[i] - m).exp();
+        x[i] = e;
+        sum += e;
         i += 1;
     }
+    sum
 }
 
 #[target_feature(enable = "neon")]
@@ -231,39 +279,60 @@ unsafe fn axpy_neon(dst: &mut [f32], src: &[f32], scale: f32) {
     }
 }
 
-/// Four `axpy`s sharing `b`'s vector loads across four destination rows —
-/// see [`crate::kernel::Kernel::axpy4`].
+/// PV accumulation for a 4-row group against a whole KV tile, `d_head`-chunk
+/// outer / V-row inner: each chunk's 4 accumulator registers stay resident
+/// across the entire `bc` sweep and are written back to `acc` only once per
+/// chunk, instead of once per V-row — see [`crate::kernel::Kernel::pv4`].
 #[target_feature(enable = "neon")]
-unsafe fn axpy4_neon(dst: [&mut [f32]; 4], b: &[f32], scale: [f32; 4]) {
-    let [d0, d1, d2, d3] = dst;
-    debug_assert_eq!(d0.len(), b.len());
-    debug_assert_eq!(d1.len(), b.len());
-    debug_assert_eq!(d2.len(), b.len());
-    debug_assert_eq!(d3.len(), b.len());
-    let len = b.len();
-    let vs0 = vdupq_n_f32(scale[0]);
-    let vs1 = vdupq_n_f32(scale[1]);
-    let vs2 = vdupq_n_f32(scale[2]);
-    let vs3 = vdupq_n_f32(scale[3]);
-    let mut i = 0usize;
-    while i + 4 <= len {
-        let bv = vld1q_f32(b.as_ptr().add(i)); // loaded once, shared 4 ways
-        let r0 = vfmaq_f32(vld1q_f32(d0.as_ptr().add(i)), bv, vs0);
-        vst1q_f32(d0.as_mut_ptr().add(i), r0);
-        let r1 = vfmaq_f32(vld1q_f32(d1.as_ptr().add(i)), bv, vs1);
-        vst1q_f32(d1.as_mut_ptr().add(i), r1);
-        let r2 = vfmaq_f32(vld1q_f32(d2.as_ptr().add(i)), bv, vs2);
-        vst1q_f32(d2.as_mut_ptr().add(i), r2);
-        let r3 = vfmaq_f32(vld1q_f32(d3.as_ptr().add(i)), bv, vs3);
-        vst1q_f32(d3.as_mut_ptr().add(i), r3);
-        i += 4;
+unsafe fn pv4_neon(acc: [&mut [f32]; 4], v_block: &[f32], p: [&[f32]; 4]) {
+    let [a0, a1, a2, a3] = acc;
+    let d = a0.len();
+    debug_assert_eq!(a1.len(), d);
+    debug_assert_eq!(a2.len(), d);
+    debug_assert_eq!(a3.len(), d);
+    let bc = p[0].len();
+    debug_assert_eq!(v_block.len(), bc * d);
+    debug_assert_eq!(p[1].len(), bc);
+    debug_assert_eq!(p[2].len(), bc);
+    debug_assert_eq!(p[3].len(), bc);
+
+    let mut chunk = 0usize;
+    while chunk + 4 <= d {
+        let mut acc0 = vld1q_f32(a0.as_ptr().add(chunk));
+        let mut acc1 = vld1q_f32(a1.as_ptr().add(chunk));
+        let mut acc2 = vld1q_f32(a2.as_ptr().add(chunk));
+        let mut acc3 = vld1q_f32(a3.as_ptr().add(chunk));
+        let mut j = 0usize;
+        while j < bc {
+            let vv = vld1q_f32(v_block.as_ptr().add(j * d + chunk));
+            acc0 = vfmaq_f32(acc0, vv, vdupq_n_f32(p[0][j]));
+            acc1 = vfmaq_f32(acc1, vv, vdupq_n_f32(p[1][j]));
+            acc2 = vfmaq_f32(acc2, vv, vdupq_n_f32(p[2][j]));
+            acc3 = vfmaq_f32(acc3, vv, vdupq_n_f32(p[3][j]));
+            j += 1;
+        }
+        vst1q_f32(a0.as_mut_ptr().add(chunk), acc0);
+        vst1q_f32(a1.as_mut_ptr().add(chunk), acc1);
+        vst1q_f32(a2.as_mut_ptr().add(chunk), acc2);
+        vst1q_f32(a3.as_mut_ptr().add(chunk), acc3);
+        chunk += 4;
     }
-    while i < len {
-        d0[i] += b[i] * scale[0];
-        d1[i] += b[i] * scale[1];
-        d2[i] += b[i] * scale[2];
-        d3[i] += b[i] * scale[3];
-        i += 1;
+    while chunk < d {
+        let (mut s0, mut s1, mut s2, mut s3) = (a0[chunk], a1[chunk], a2[chunk], a3[chunk]);
+        let mut j = 0usize;
+        while j < bc {
+            let vv = v_block[j * d + chunk];
+            s0 += vv * p[0][j];
+            s1 += vv * p[1][j];
+            s2 += vv * p[2][j];
+            s3 += vv * p[3][j];
+            j += 1;
+        }
+        a0[chunk] = s0;
+        a1[chunk] = s1;
+        a2[chunk] = s2;
+        a3[chunk] = s3;
+        chunk += 1;
     }
 }
 
@@ -305,24 +374,6 @@ unsafe fn max_reduce_neon(x: &[f32]) -> f32 {
     m
 }
 
-#[target_feature(enable = "neon")]
-unsafe fn sum_reduce_neon(x: &[f32]) -> f32 {
-    let len = x.len();
-    let mut acc = vdupq_n_f32(0.0);
-    let mut i = 0usize;
-    while i + 4 <= len {
-        let v = vld1q_f32(x.as_ptr().add(i));
-        acc = vaddq_f32(acc, v);
-        i += 4;
-    }
-    let mut s = vaddvq_f32(acc);
-    while i < len {
-        s += x[i];
-        i += 1;
-    }
-    s
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,7 +382,7 @@ mod tests {
     fn exp_matches_std() {
         let xs: Vec<f32> = (-800..800).map(|i| i as f32 * 0.1).collect();
         let mut got = xs.clone();
-        unsafe { sub_exp_inplace_neon(&mut got, 0.0) };
+        let sum = unsafe { sub_exp_sum_inplace_neon(&mut got, 0.0) };
         let mut max_rel_err = 0.0f32;
         for (x, g) in xs.iter().zip(got.iter()) {
             let want = x.exp();
@@ -344,6 +395,11 @@ mod tests {
                 );
             }
         }
+        let want_sum: f32 = got.iter().sum();
+        assert!(
+            (sum - want_sum).abs() < 1e-3 * want_sum.abs().max(1.0),
+            "returned sum {sum} vs actual {want_sum}"
+        );
         eprintln!("max relative error vs f32::exp: {max_rel_err:e}");
     }
 
@@ -391,29 +447,59 @@ mod tests {
     }
 
     #[test]
-    fn axpy4_matches_four_axpys() {
-        for len in [0usize, 1, 3, 4, 5, 7, 8, 9, 33] {
-            let mk =
-                |seed: f32| -> Vec<f32> { (0..len).map(|i| (i as f32 * seed).cos()).collect() };
-            let b = mk(0.71);
-            let scale = [1.1f32, -2.2, 0.0, 3.3];
+    fn dot4x4_matches_naive() {
+        for d in [0usize, 1, 3, 4, 5, 7, 8, 9, 33] {
+            let mk = |seed: f32| -> Vec<f32> { (0..d).map(|i| (i as f32 * seed).sin()).collect() };
+            let q = [mk(0.11), mk(0.23), mk(0.37), mk(0.51)];
+            let k = [mk(0.61), mk(0.67), mk(0.73), mk(0.79)];
 
-            let mut want = [mk(0.11), mk(0.23), mk(0.37), mk(0.51)];
-            for (row, &s) in want.iter_mut().zip(scale.iter()) {
-                unsafe { axpy_neon(row, &b, s) };
+            let want: [[f32; 4]; 4] =
+                std::array::from_fn(|r| std::array::from_fn(|c| unsafe { dot_neon(&q[r], &k[c]) }));
+            let got =
+                unsafe { dot4x4_neon([&q[0], &q[1], &q[2], &q[3]], [&k[0], &k[1], &k[2], &k[3]]) };
+            for r in 0..4 {
+                for c in 0..4 {
+                    assert!(
+                        (want[r][c] - got[r][c]).abs() < 1e-3 * (want[r][c].abs() + 1.0),
+                        "d={d} r={r} c={c} want={} got={}",
+                        want[r][c],
+                        got[r][c]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pv4_matches_naive() {
+        for (bc, d) in [(0usize, 4usize), (1, 4), (3, 5), (4, 4), (5, 7), (17, 33)] {
+            let v_block: Vec<f32> = (0..bc * d).map(|i| (i as f32 * 0.03).cos()).collect();
+            let p: [Vec<f32>; 4] = std::array::from_fn(|r| {
+                (0..bc)
+                    .map(|j| ((j + r) as f32 * 0.07).sin())
+                    .collect::<Vec<f32>>()
+            });
+            let init: [Vec<f32>; 4] =
+                std::array::from_fn(|r| (0..d).map(|i| (i as f32 + r as f32) * 0.5).collect());
+
+            let mut want = init.clone();
+            for (row, pr) in want.iter_mut().zip(p.iter()) {
+                for (j, v_row) in v_block.chunks_exact(d).enumerate() {
+                    unsafe { axpy_neon(row, v_row, pr[j]) };
+                }
             }
 
-            let mut got = [mk(0.11), mk(0.23), mk(0.37), mk(0.51)];
+            let mut got = init;
             let [g0, g1, g2, g3] = &mut got;
-            unsafe { axpy4_neon([g0, g1, g2, g3], &b, scale) };
+            unsafe { pv4_neon([g0, g1, g2, g3], &v_block, [&p[0], &p[1], &p[2], &p[3]]) };
 
-            for k in 0..4 {
-                for i in 0..len {
+            for r in 0..4 {
+                for i in 0..d {
                     assert!(
-                        (want[k][i] - got[k][i]).abs() < 1e-4,
-                        "len={len} k={k} i={i} want={} got={}",
-                        want[k][i],
-                        got[k][i]
+                        (want[r][i] - got[r][i]).abs() < 1e-3 * (want[r][i].abs() + 1.0),
+                        "bc={bc} d={d} r={r} i={i} want={} got={}",
+                        want[r][i],
+                        got[r][i]
                     );
                 }
             }
@@ -424,11 +510,8 @@ mod tests {
     fn reductions_match_scalar() {
         for len in [0usize, 1, 5, 8, 13, 16, 33] {
             let x: Vec<f32> = (0..len).map(|i| ((i as f32) * 1.3).sin() * 5.0).collect();
-            let want_sum: f32 = x.iter().sum();
             let want_max: f32 = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let got_sum = unsafe { sum_reduce_neon(&x) };
             let got_max = unsafe { max_reduce_neon(&x) };
-            assert!((want_sum - got_sum).abs() < 1e-3, "len={len} sum");
             assert_eq!(want_max, got_max, "len={len} max");
         }
     }

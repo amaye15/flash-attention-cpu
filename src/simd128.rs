@@ -43,8 +43,13 @@ impl Kernel for Simd128Kernel {
     }
 
     #[inline]
-    unsafe fn sub_exp_inplace(x: &mut [f32], m: f32) {
-        sub_exp_inplace_simd128(x, m)
+    unsafe fn dot4x4(q: [&[f32]; 4], k: [&[f32]; 4]) -> [[f32; 4]; 4] {
+        dot4x4_simd128(q, k)
+    }
+
+    #[inline]
+    unsafe fn sub_exp_sum_inplace(x: &mut [f32], m: f32) -> f32 {
+        sub_exp_sum_inplace_simd128(x, m)
     }
 
     #[inline]
@@ -53,8 +58,8 @@ impl Kernel for Simd128Kernel {
     }
 
     #[inline]
-    unsafe fn axpy4(dst: [&mut [f32]; 4], b: &[f32], scale: [f32; 4]) {
-        axpy4_simd128(dst, b, scale)
+    unsafe fn pv4(acc: [&mut [f32]; 4], v_block: &[f32], p: [&[f32]; 4]) {
+        pv4_simd128(acc, v_block, p)
     }
 
     #[inline]
@@ -65,11 +70,6 @@ impl Kernel for Simd128Kernel {
     #[inline]
     unsafe fn max_reduce(x: &[f32]) -> f32 {
         max_reduce_simd128(x)
-    }
-
-    #[inline]
-    unsafe fn sum_reduce(x: &[f32]) -> f32 {
-        sum_reduce_simd128(x)
     }
 }
 
@@ -175,6 +175,46 @@ unsafe fn dot4_simd128(a0: &[f32], a1: &[f32], a2: &[f32], a3: &[f32], b: &[f32]
     sums
 }
 
+/// 4 query rows x 4 key rows blocked together — see
+/// [`crate::kernel::Kernel::dot4x4`]. No native FMA (see module docs), so
+/// each accumulation is a separate `mul` + `add`.
+#[target_feature(enable = "simd128")]
+unsafe fn dot4x4_simd128(q: [&[f32]; 4], k: [&[f32]; 4]) -> [[f32; 4]; 4] {
+    let d = q[0].len();
+    let mut acc = [[f32x4_splat(0.0); 4]; 4];
+    let mut p = 0usize;
+    while p + 4 <= d {
+        let qv = [
+            v128_load(q[0].as_ptr().add(p) as *const v128),
+            v128_load(q[1].as_ptr().add(p) as *const v128),
+            v128_load(q[2].as_ptr().add(p) as *const v128),
+            v128_load(q[3].as_ptr().add(p) as *const v128),
+        ];
+        for c in 0..4 {
+            let kv = v128_load(k[c].as_ptr().add(p) as *const v128); // loaded once, shared 4 ways
+            for r in 0..4 {
+                acc[r][c] = f32x4_add(acc[r][c], f32x4_mul(qv[r], kv));
+            }
+        }
+        p += 4;
+    }
+    let mut sums = [[0.0f32; 4]; 4];
+    for r in 0..4 {
+        for c in 0..4 {
+            sums[r][c] = hsum128_ps(acc[r][c]);
+        }
+    }
+    while p < d {
+        for r in 0..4 {
+            for c in 0..4 {
+                sums[r][c] += q[r][p] * k[c][p];
+            }
+        }
+        p += 1;
+    }
+    sums
+}
+
 /// Vectorized exp over 4 lanes. See module docs for the algorithm.
 ///
 /// The polynomial coefficients below are the same published Cephes-derived
@@ -232,24 +272,32 @@ unsafe fn exp128_ps(x: v128) -> v128 {
     f32x4_mul(y, pow2n)
 }
 
-/// Fused `x[i] = exp(x[i] - m)`: subtract and exponential in the same pass
-/// over `x` (one load/store per lane instead of two separate passes).
+/// Fused `x[i] = exp(x[i] - m)`, returning `sum(x)` after the exponential:
+/// subtract, exponential, and sum accumulation all in the same pass over
+/// `x` (one load/store per lane, plus the sum, instead of two separate
+/// passes).
 #[target_feature(enable = "simd128")]
-unsafe fn sub_exp_inplace_simd128(x: &mut [f32], m: f32) {
+unsafe fn sub_exp_sum_inplace_simd128(x: &mut [f32], m: f32) -> f32 {
     let len = x.len();
     let vm = f32x4_splat(m);
+    let mut sum_acc = f32x4_splat(0.0);
     let mut i = 0usize;
     while i + 4 <= len {
         let v = v128_load(x.as_ptr().add(i) as *const v128);
         let v = f32x4_sub(v, vm);
         let r = exp128_ps(v);
         v128_store(x.as_mut_ptr().add(i) as *mut v128, r);
+        sum_acc = f32x4_add(sum_acc, r);
         i += 4;
     }
+    let mut sum = hsum128_ps(sum_acc);
     while i < len {
-        x[i] = (x[i] - m).exp();
+        let e = (x[i] - m).exp();
+        x[i] = e;
+        sum += e;
         i += 1;
     }
+    sum
 }
 
 #[target_feature(enable = "simd128")]
@@ -271,51 +319,60 @@ unsafe fn axpy_simd128(dst: &mut [f32], src: &[f32], scale: f32) {
     }
 }
 
-/// Four `axpy`s sharing `b`'s vector loads across four destination rows —
-/// see [`crate::kernel::Kernel::axpy4`].
+/// PV accumulation for a 4-row group against a whole KV tile, `d_head`-chunk
+/// outer / V-row inner: each chunk's 4 accumulator registers stay resident
+/// across the entire `bc` sweep and are written back to `acc` only once per
+/// chunk, instead of once per V-row — see [`crate::kernel::Kernel::pv4`].
 #[target_feature(enable = "simd128")]
-unsafe fn axpy4_simd128(dst: [&mut [f32]; 4], b: &[f32], scale: [f32; 4]) {
-    let [d0, d1, d2, d3] = dst;
-    debug_assert_eq!(d0.len(), b.len());
-    debug_assert_eq!(d1.len(), b.len());
-    debug_assert_eq!(d2.len(), b.len());
-    debug_assert_eq!(d3.len(), b.len());
-    let len = b.len();
-    let vs0 = f32x4_splat(scale[0]);
-    let vs1 = f32x4_splat(scale[1]);
-    let vs2 = f32x4_splat(scale[2]);
-    let vs3 = f32x4_splat(scale[3]);
-    let mut i = 0usize;
-    while i + 4 <= len {
-        let bv = v128_load(b.as_ptr().add(i) as *const v128); // loaded once, shared 4 ways
-        let r0 = f32x4_add(
-            v128_load(d0.as_ptr().add(i) as *const v128),
-            f32x4_mul(bv, vs0),
-        );
-        v128_store(d0.as_mut_ptr().add(i) as *mut v128, r0);
-        let r1 = f32x4_add(
-            v128_load(d1.as_ptr().add(i) as *const v128),
-            f32x4_mul(bv, vs1),
-        );
-        v128_store(d1.as_mut_ptr().add(i) as *mut v128, r1);
-        let r2 = f32x4_add(
-            v128_load(d2.as_ptr().add(i) as *const v128),
-            f32x4_mul(bv, vs2),
-        );
-        v128_store(d2.as_mut_ptr().add(i) as *mut v128, r2);
-        let r3 = f32x4_add(
-            v128_load(d3.as_ptr().add(i) as *const v128),
-            f32x4_mul(bv, vs3),
-        );
-        v128_store(d3.as_mut_ptr().add(i) as *mut v128, r3);
-        i += 4;
+unsafe fn pv4_simd128(acc: [&mut [f32]; 4], v_block: &[f32], p: [&[f32]; 4]) {
+    let [a0, a1, a2, a3] = acc;
+    let d = a0.len();
+    debug_assert_eq!(a1.len(), d);
+    debug_assert_eq!(a2.len(), d);
+    debug_assert_eq!(a3.len(), d);
+    let bc = p[0].len();
+    debug_assert_eq!(v_block.len(), bc * d);
+    debug_assert_eq!(p[1].len(), bc);
+    debug_assert_eq!(p[2].len(), bc);
+    debug_assert_eq!(p[3].len(), bc);
+
+    let mut chunk = 0usize;
+    while chunk + 4 <= d {
+        let mut acc0 = v128_load(a0.as_ptr().add(chunk) as *const v128);
+        let mut acc1 = v128_load(a1.as_ptr().add(chunk) as *const v128);
+        let mut acc2 = v128_load(a2.as_ptr().add(chunk) as *const v128);
+        let mut acc3 = v128_load(a3.as_ptr().add(chunk) as *const v128);
+        let mut j = 0usize;
+        while j < bc {
+            let vv = v128_load(v_block.as_ptr().add(j * d + chunk) as *const v128);
+            acc0 = f32x4_add(acc0, f32x4_mul(vv, f32x4_splat(p[0][j])));
+            acc1 = f32x4_add(acc1, f32x4_mul(vv, f32x4_splat(p[1][j])));
+            acc2 = f32x4_add(acc2, f32x4_mul(vv, f32x4_splat(p[2][j])));
+            acc3 = f32x4_add(acc3, f32x4_mul(vv, f32x4_splat(p[3][j])));
+            j += 1;
+        }
+        v128_store(a0.as_mut_ptr().add(chunk) as *mut v128, acc0);
+        v128_store(a1.as_mut_ptr().add(chunk) as *mut v128, acc1);
+        v128_store(a2.as_mut_ptr().add(chunk) as *mut v128, acc2);
+        v128_store(a3.as_mut_ptr().add(chunk) as *mut v128, acc3);
+        chunk += 4;
     }
-    while i < len {
-        d0[i] += b[i] * scale[0];
-        d1[i] += b[i] * scale[1];
-        d2[i] += b[i] * scale[2];
-        d3[i] += b[i] * scale[3];
-        i += 1;
+    while chunk < d {
+        let (mut s0, mut s1, mut s2, mut s3) = (a0[chunk], a1[chunk], a2[chunk], a3[chunk]);
+        let mut j = 0usize;
+        while j < bc {
+            let vv = v_block[j * d + chunk];
+            s0 += vv * p[0][j];
+            s1 += vv * p[1][j];
+            s2 += vv * p[2][j];
+            s3 += vv * p[3][j];
+            j += 1;
+        }
+        a0[chunk] = s0;
+        a1[chunk] = s1;
+        a2[chunk] = s2;
+        a3[chunk] = s3;
+        chunk += 1;
     }
 }
 
@@ -357,24 +414,6 @@ unsafe fn max_reduce_simd128(x: &[f32]) -> f32 {
     m
 }
 
-#[target_feature(enable = "simd128")]
-unsafe fn sum_reduce_simd128(x: &[f32]) -> f32 {
-    let len = x.len();
-    let mut acc = f32x4_splat(0.0);
-    let mut i = 0usize;
-    while i + 4 <= len {
-        let v = v128_load(x.as_ptr().add(i) as *const v128);
-        acc = f32x4_add(acc, v);
-        i += 4;
-    }
-    let mut s = hsum128_ps(acc);
-    while i < len {
-        s += x[i];
-        i += 1;
-    }
-    s
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,7 +422,7 @@ mod tests {
     fn exp_matches_std() {
         let xs: Vec<f32> = (-800..800).map(|i| i as f32 * 0.1).collect();
         let mut got = xs.clone();
-        unsafe { sub_exp_inplace_simd128(&mut got, 0.0) };
+        let sum = unsafe { sub_exp_sum_inplace_simd128(&mut got, 0.0) };
         let mut max_rel_err = 0.0f32;
         for (x, g) in xs.iter().zip(got.iter()) {
             let want = x.exp();
@@ -396,6 +435,11 @@ mod tests {
                 );
             }
         }
+        let want_sum: f32 = got.iter().sum();
+        assert!(
+            (sum - want_sum).abs() < 1e-3 * want_sum.abs().max(1.0),
+            "returned sum {sum} vs actual {want_sum}"
+        );
         eprintln!("max relative error vs f32::exp: {max_rel_err:e}");
     }
 
@@ -443,29 +487,61 @@ mod tests {
     }
 
     #[test]
-    fn axpy4_matches_four_axpys() {
-        for len in [0usize, 1, 3, 4, 5, 7, 8, 9, 33] {
-            let mk =
-                |seed: f32| -> Vec<f32> { (0..len).map(|i| (i as f32 * seed).cos()).collect() };
-            let b = mk(0.71);
-            let scale = [1.1f32, -2.2, 0.0, 3.3];
+    fn dot4x4_matches_naive() {
+        for d in [0usize, 1, 3, 4, 5, 7, 8, 9, 33] {
+            let mk = |seed: f32| -> Vec<f32> { (0..d).map(|i| (i as f32 * seed).sin()).collect() };
+            let q = [mk(0.11), mk(0.23), mk(0.37), mk(0.51)];
+            let k = [mk(0.61), mk(0.67), mk(0.73), mk(0.79)];
 
-            let mut want = [mk(0.11), mk(0.23), mk(0.37), mk(0.51)];
-            for (row, &s) in want.iter_mut().zip(scale.iter()) {
-                unsafe { axpy_simd128(row, &b, s) };
+            let want: [[f32; 4]; 4] = std::array::from_fn(|r| {
+                std::array::from_fn(|c| unsafe { dot_simd128(&q[r], &k[c]) })
+            });
+            let got = unsafe {
+                dot4x4_simd128([&q[0], &q[1], &q[2], &q[3]], [&k[0], &k[1], &k[2], &k[3]])
+            };
+            for r in 0..4 {
+                for c in 0..4 {
+                    assert!(
+                        (want[r][c] - got[r][c]).abs() < 1e-3 * (want[r][c].abs() + 1.0),
+                        "d={d} r={r} c={c} want={} got={}",
+                        want[r][c],
+                        got[r][c]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pv4_matches_naive() {
+        for (bc, d) in [(0usize, 4usize), (1, 4), (3, 5), (4, 4), (5, 7), (17, 33)] {
+            let v_block: Vec<f32> = (0..bc * d).map(|i| (i as f32 * 0.03).cos()).collect();
+            let p: [Vec<f32>; 4] = std::array::from_fn(|r| {
+                (0..bc)
+                    .map(|j| ((j + r) as f32 * 0.07).sin())
+                    .collect::<Vec<f32>>()
+            });
+            let init: [Vec<f32>; 4] =
+                std::array::from_fn(|r| (0..d).map(|i| (i as f32 + r as f32) * 0.5).collect());
+
+            let mut want = init.clone();
+            for (row, pr) in want.iter_mut().zip(p.iter()) {
+                for (j, v_row) in v_block.chunks_exact(d).enumerate() {
+                    unsafe { axpy_simd128(row, v_row, pr[j]) };
+                }
             }
 
-            let mut got = [mk(0.11), mk(0.23), mk(0.37), mk(0.51)];
+            let mut got = init;
             let [g0, g1, g2, g3] = &mut got;
-            unsafe { axpy4_simd128([g0, g1, g2, g3], &b, scale) };
+            unsafe { pv4_simd128([g0, g1, g2, g3], &v_block, [&p[0], &p[1], &p[2], &p[3]]) };
 
-            for k in 0..4 {
-                for i in 0..len {
+            for r in 0..4 {
+                for i in 0..d {
                     assert!(
-                        (want[k][i] - got[k][i]).abs() < 1e-4,
-                        "len={len} k={k} i={i} want={} got={}",
-                        want[k][i],
-                        got[k][i]
+                        (want[r][i] - got[r][i]).abs() < 1e-3 * (want[r][i].abs() + 1.0),
+                        "bc={bc} d={d} r={r} i={i} want={} got={}",
+                        want[r][i],
+                        got[r][i]
                     );
                 }
             }
@@ -476,11 +552,8 @@ mod tests {
     fn reductions_match_scalar() {
         for len in [0usize, 1, 5, 8, 13, 16, 33] {
             let x: Vec<f32> = (0..len).map(|i| ((i as f32) * 1.3).sin() * 5.0).collect();
-            let want_sum: f32 = x.iter().sum();
             let want_max: f32 = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let got_sum = unsafe { sum_reduce_simd128(&x) };
             let got_max = unsafe { max_reduce_simd128(&x) };
-            assert!((want_sum - got_sum).abs() < 1e-3, "len={len} sum");
             assert_eq!(want_max, got_max, "len={len} max");
         }
     }

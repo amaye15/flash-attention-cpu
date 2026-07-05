@@ -136,7 +136,7 @@ fn matches_naive_ragged_sizes() {
 
 #[test]
 fn block_size_q_not_a_multiple_of_four() {
-    // The register-blocked QK^T/PV loops (see `Kernel::dot4`/`axpy4`)
+    // The register-blocked QK^T/PV loops (see `Kernel::dot4x4`/`pv4`)
     // process query rows in groups of 4 with a scalar-row fallback for the
     // remainder. Every `block_size_q` used elsewhere in this file happens
     // to be a multiple of 4, so a full (non-final) query block never hits
@@ -147,6 +147,25 @@ fn block_size_q_not_a_multiple_of_four() {
         for &br in &[3usize, 5, 6, 7] {
             run_case(variant, 23, 29, 24, br, 12, false);
             run_case(variant, 23, 29, 24, br, 12, true);
+        }
+    }
+}
+
+#[test]
+fn block_size_kv_not_a_multiple_of_four() {
+    // The register-blocked QK^T loop's bulk path (`Kernel::dot4x4`) blocks
+    // both query rows *and* key rows by 4; leftover columns within an
+    // otherwise-full row-group fall back to `Kernel::dot4`. Every
+    // `block_size_kv` used elsewhere in this file happens to be a multiple
+    // of 4, so that column-remainder path never gets exercised there —
+    // pairing a `block_size_q` that IS a multiple of 4 (so every row-group
+    // is full) with these `bc` values (3, 5, 6, 7) makes every full
+    // row-group hit it, exercising 3, 1, 2, and 3 leftover columns
+    // respectively (mod 4).
+    for variant in ALL_VARIANTS {
+        for &bc in &[3usize, 5, 6, 7] {
+            run_case(variant, 29, 23, 24, 12, bc, false);
+            run_case(variant, 29, 23, 24, 12, bc, true);
         }
     }
 }

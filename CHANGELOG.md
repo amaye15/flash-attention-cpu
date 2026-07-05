@@ -15,30 +15,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CONTRIBUTING.md`, this changelog.
 - MSRV set to 1.89 (verified empirically — the AVX-512F intrinsics are the
   binding constraint; NEON/SIMD128/rayon all work much earlier).
-- Register-blocked micro-kernel: `Kernel::dot4`/`Kernel::axpy4` process 4
-  query rows at once, sharing each streamed `K`/`V` row's vector loads across
-  four independent FMA accumulator chains (BLIS/OpenBLAS-style register
-  tiling), implemented for all five kernels (scalar, AVX2, AVX-512F, NEON,
-  SIMD128) and wired into the QK^T/PV loops of `v1`/`v2`/`v3` with a
-  scalar-row fallback for the `block_size_q % 4` remainder. Validated first
-  as an isolated NEON micro-benchmark (1.74x at `d_head=64`, 1.29x at
-  `d_head=128`) before being wired in.
-- `Kernel::sub_exp_inplace` fuses the online-softmax subtract-max and `exp`
-  steps into a single SIMD pass per kernel (previously two separate
-  traversals of the score row).
-- `tests/correctness.rs::block_size_q_not_a_multiple_of_four`, covering the
-  register-blocked micro-kernel's scalar-row remainder path.
+- Register-blocked micro-kernel, in two layers:
+  - `Kernel::dot4`: 4 query rows blocked against 1 key row at a time,
+    sharing the key row's vector loads across four independent FMA
+    accumulator chains.
+  - `Kernel::dot4x4`: 4 query rows *and* 4 key rows blocked together
+    (BLIS/OpenBLAS-style two-sided packed register tiling), sharing both
+    operands' loads across 16 independent FMA accumulator chains — the
+    QK^T bulk path, falling back to `dot4` for the `block_size_kv % 4`
+    column remainder and to `dot` for the `block_size_q % 4` row remainder.
+  - `Kernel::pv4`: PV accumulation for a 4-query-row group against a whole
+    KV tile, keeping each `d_head`-chunk's accumulator registers resident
+    across the entire key/value sweep and writing back to memory once per
+    chunk instead of once per key/value row (replaces the earlier
+    `axpy4`, which read/wrote the accumulator through memory on every row).
+  - Implemented for all five kernels (scalar, AVX2, AVX-512F, NEON,
+    SIMD128) and wired into `v1`/`v2`/`v3`. Each layer was validated first
+    as an isolated NEON micro-benchmark before being wired in: `dot4`/`pv4`'s
+    one-sided predecessor measured 1.74x/1.29x (`d_head=64`/`128`); `dot4x4`
+    measured a further ~1.5-1.6x over that, and `pv4` ~1.2x over a naive
+    one-`axpy`-per-row PV loop.
+- `Kernel::sub_exp_sum_inplace` fuses the online-softmax subtract-max,
+  `exp`, and sum-reduction into a single SIMD pass per kernel (previously
+  three separate traversals of the score row: max, subtract+exp, sum).
+- `tests/correctness.rs::block_size_q_not_a_multiple_of_four` and
+  `::block_size_kv_not_a_multiple_of_four`, covering the register-blocked
+  micro-kernel's row and column remainder paths.
+- CI now runs `cargo run --release --example bench_quick` (plus a CPU-flags
+  diagnostic) on every `test` job leg, giving real — if noisier,
+  shared-runner — x86_64 (AVX2/AVX-512F) and second-aarch64 timing data for
+  the first time in this project's history.
 
 ### Changed
 
 - `run_v1`/`run_v2`/`run_v3` now use Rayon's `for_each_init` to allocate each
   query block's scratch buffers (`m`/`l`/`acc`/scores) once per worker thread
   instead of once per block.
-- Measured net effect of the above (Apple M4, aarch64, NEON kernel): roughly
-  1.9-2x single-threaded speedup over the pre-optimization baseline across
-  `flash_attention_v1/_v2/_v3`, causal and non-causal, at every benchmarked
-  `seq_len`; `naive_attention` is unaffected (it doesn't use the `Kernel`
-  trait). See the README's Benchmarks section for full before/after tables.
+- Measured net effect on this machine (Apple M4, aarch64, NEON kernel),
+  across both rounds of the above: roughly 3.3x single-threaded and 18x
+  default-multithreaded speedup over naive for `flash_attention_v2` at
+  `seq_len=2048` (up from ~1.5x/~8-9x before either round); `naive_attention`
+  is unaffected throughout (it doesn't use the `Kernel` trait). See the
+  README's Benchmarks section for full before/after tables and the
+  isolated-microbenchmark numbers behind each change.
 
 ## [0.1.0]
 

@@ -179,23 +179,43 @@ fn run_v2<K: Kernel + Sync>(
                 let scores_slice = &mut scores_buf[..this_br * this_bc];
 
                 // S_ij = scale * Q_i . K_j  (Q/K rows are contiguous, so this
-                // is a plain dot product — no transpose needed). Blocked 4
-                // query rows at a time: each K row's vector loads are
-                // shared across 4 FMA accumulator chains inside `dot4`
-                // instead of being reloaded once per query row — see
-                // `Kernel::dot4`'s docs for the measured speedup.
+                // is a plain dot product — no transpose needed). Three-tier
+                // register blocking: the bulk of the tile goes through
+                // `dot4x4` (4 query rows x 4 key rows, both operands' loads
+                // shared — see its docs for the measured speedup over
+                // `dot4` alone), leftover columns (`this_bc % 4`) for a full
+                // row-group fall back to `dot4`, and leftover rows
+                // (`this_br % 4`) fall back to the scalar `dot`.
                 let mut i = 0;
                 while i + 4 <= this_br {
                     let q0 = &q_block[i * d_head..(i + 1) * d_head];
                     let q1 = &q_block[(i + 1) * d_head..(i + 2) * d_head];
                     let q2 = &q_block[(i + 2) * d_head..(i + 3) * d_head];
                     let q3 = &q_block[(i + 3) * d_head..(i + 4) * d_head];
-                    for (j, kj_row) in k_block.chunks_exact(d_head).enumerate() {
+                    let qg = [q0, q1, q2, q3];
+
+                    let mut j = 0;
+                    while j + 4 <= this_bc {
+                        let k0 = &k_block[j * d_head..(j + 1) * d_head];
+                        let k1 = &k_block[(j + 1) * d_head..(j + 2) * d_head];
+                        let k2 = &k_block[(j + 2) * d_head..(j + 3) * d_head];
+                        let k3 = &k_block[(j + 3) * d_head..(j + 4) * d_head];
+                        let s = unsafe { K::dot4x4(qg, [k0, k1, k2, k3]) };
+                        for r in 0..4 {
+                            for c in 0..4 {
+                                scores_slice[(i + r) * this_bc + (j + c)] = s[r][c] * scale;
+                            }
+                        }
+                        j += 4;
+                    }
+                    while j < this_bc {
+                        let kj_row = &k_block[j * d_head..(j + 1) * d_head];
                         let [s0, s1, s2, s3] = unsafe { K::dot4(q0, q1, q2, q3, kj_row) };
                         scores_slice[i * this_bc + j] = s0 * scale;
                         scores_slice[(i + 1) * this_bc + j] = s1 * scale;
                         scores_slice[(i + 2) * this_bc + j] = s2 * scale;
                         scores_slice[(i + 3) * this_bc + j] = s3 * scale;
+                        j += 1;
                     }
                     i += 4;
                 }
@@ -232,9 +252,7 @@ fn run_v2<K: Kernel + Sync>(
                     let block_max = unsafe { K::max_reduce(s_row) };
                     let new_m = m[i].max(block_max);
 
-                    unsafe { K::sub_exp_inplace(s_row, new_m) };
-
-                    let block_sum = unsafe { K::sum_reduce(s_row) };
+                    let block_sum = unsafe { K::sub_exp_sum_inplace(s_row, new_m) };
                     let correction = (m[i] - new_m).exp();
 
                     l[i] = correction * l[i] + block_sum;
@@ -245,13 +263,14 @@ fn run_v2<K: Kernel + Sync>(
                     m[i] = new_m;
                 }
 
-                // PV accumulation, 4 rows at a time: each V row's vector
-                // loads are shared across 4 accumulator rows via `axpy4`
-                // instead of being reloaded once per row — the same
-                // register-blocking idea as the QK^T step above. Rows are
-                // fully independent here (each only needs its own
-                // just-finished softmax state above), so grouping them by 4
-                // changes nothing but the order this work happens in.
+                // PV accumulation, 4 rows at a time via `pv4`: each
+                // `d_head`-chunk's accumulator registers stay resident
+                // across the whole `this_bc` sweep instead of round-tripping
+                // through memory once per V row — see `Kernel::pv4`'s docs
+                // for the measured speedup. Rows are fully independent here
+                // (each only needs its own just-finished softmax state
+                // above), so grouping them by 4 changes nothing but the
+                // order this work happens in.
                 let mut i = 0;
                 while i + 4 <= this_br {
                     let mut chunks = acc[i * d_head..(i + 4) * d_head].chunks_exact_mut(d_head);
@@ -265,12 +284,7 @@ fn run_v2<K: Kernel + Sync>(
                     let p2 = &scores_slice[(i + 2) * this_bc..(i + 3) * this_bc];
                     let p3 = &scores_slice[(i + 3) * this_bc..(i + 4) * this_bc];
 
-                    for (j, v_row) in v_block.chunks_exact(d_head).enumerate() {
-                        let scale4 = [p0[j], p1[j], p2[j], p3[j]];
-                        unsafe {
-                            K::axpy4([&mut *d0, &mut *d1, &mut *d2, &mut *d3], v_row, scale4)
-                        };
-                    }
+                    unsafe { K::pv4([d0, d1, d2, d3], v_block, [p0, p1, p2, p3]) };
                     i += 4;
                 }
                 while i < this_br {

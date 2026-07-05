@@ -43,10 +43,21 @@ impl Kernel for ScalarKernel {
     }
 
     #[inline]
-    unsafe fn sub_exp_inplace(x: &mut [f32], m: f32) {
+    unsafe fn dot4x4(q: [&[f32]; 4], k: [&[f32]; 4]) -> [[f32; 4]; 4] {
+        // No register-blocking benefit possible without SIMD lanes to
+        // share loads across — this exists purely so call sites in
+        // `v1.rs`/`v2.rs`/`v3.rs` don't need an arch-specific branch.
+        std::array::from_fn(|r| std::array::from_fn(|c| Self::dot(q[r], k[c])))
+    }
+
+    #[inline]
+    unsafe fn sub_exp_sum_inplace(x: &mut [f32], m: f32) -> f32 {
+        let mut sum = 0.0f32;
         for v in x.iter_mut() {
             *v = (*v - m).exp();
+            sum += *v;
         }
+        sum
     }
 
     #[inline]
@@ -58,12 +69,15 @@ impl Kernel for ScalarKernel {
     }
 
     #[inline]
-    unsafe fn axpy4(dst: [&mut [f32]; 4], b: &[f32], scale: [f32; 4]) {
-        let [d0, d1, d2, d3] = dst;
-        Self::axpy(d0, b, scale[0]);
-        Self::axpy(d1, b, scale[1]);
-        Self::axpy(d2, b, scale[2]);
-        Self::axpy(d3, b, scale[3]);
+    unsafe fn pv4(acc: [&mut [f32]; 4], v_block: &[f32], p: [&[f32]; 4]) {
+        let [a0, a1, a2, a3] = acc;
+        let d = a0.len();
+        for (j, v_row) in v_block.chunks_exact(d).enumerate() {
+            Self::axpy(a0, v_row, p[0][j]);
+            Self::axpy(a1, v_row, p[1][j]);
+            Self::axpy(a2, v_row, p[2][j]);
+            Self::axpy(a3, v_row, p[3][j]);
+        }
     }
 
     #[inline]
@@ -76,10 +90,5 @@ impl Kernel for ScalarKernel {
     #[inline]
     unsafe fn max_reduce(x: &[f32]) -> f32 {
         x.iter().copied().fold(f32::NEG_INFINITY, f32::max)
-    }
-
-    #[inline]
-    unsafe fn sum_reduce(x: &[f32]) -> f32 {
-        x.iter().sum()
     }
 }
