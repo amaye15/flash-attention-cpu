@@ -103,7 +103,12 @@ jobs:
           workspaces: fuzz
       - run: cargo install cargo-fuzz --locked
       - name: build + run each fuzz target briefly
+        # `+nightly` is required here even though the `nightly` toolchain
+        # was just installed above: this repo's `rust-toolchain.toml` pins
+        # `stable` for every plain `cargo` invocation (that override wins
+        # over `rustup default`), and cargo-fuzz needs nightly's `-Z`
+        # sanitizer flags.
         run: |
-          for target in $(cargo fuzz list); do
-            cargo fuzz run "$target" -- -max_total_time=30
+          for target in $(cargo +nightly fuzz list); do
+            cargo +nightly fuzz run "$target" -- -max_total_time=30
           done
