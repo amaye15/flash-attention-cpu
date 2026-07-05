@@ -36,6 +36,18 @@ jobs:
         run: cargo test --release
       - name: cargo run --example basic (smoke test)
         run: cargo run --release --example basic
+      - name: cpu flags (diagnostic for interpreting the benchmark below)
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            grep -m1 flags /proc/cpuinfo | tr ' ' '\n' | grep -E '^(avx2|avx512f|fma)$' || true
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            sysctl -a 2>/dev/null | grep -i 'hw.optional.neon' || true
+          else
+            echo "CPU flags not queried on $RUNNER_OS"
+          fi
+      - name: cargo run --example bench_quick (real-hardware timing, informational only — shared CI runners are noisy, not for regression gating)
+        run: cargo run --release --example bench_quick
 
   cross-check-x86_64:
     name: cross-check (x86_64-apple-darwin, from macOS aarch64 host)
