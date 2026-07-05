@@ -1,0 +1,9 @@
+# Enables the wasm32 SIMD128 kernel (src/simd128.rs) when building or
+# testing this crate from this checkout. Downstream consumers depending on
+# `flash-attention-cpu` from crates.io are unaffected by this file — Cargo
+# only reads `.cargo/config.toml` from the current workspace root, not from
+# inside dependencies — so they must opt in themselves the same way (see
+# README's WASM section) if they want the SIMD128 path instead of the
+# scalar fallback.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=+simd128"]

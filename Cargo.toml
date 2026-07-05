@@ -1,0 +1,36 @@
+[package]
+name = "flash-attention-cpu"
+version = "0.1.0"
+edition = "2021"
+description = "Pure-Rust, CPU-optimized Flash Attention: tiled online-softmax, AVX-512/AVX2/NEON/WASM-SIMD128 with scalar fallback, Rayon parallelism."
+
+[dependencies]
+rayon = "1.10"
+
+[dev-dependencies]
+rand = "0.8"
+
+# criterion pulls in rayon internally and hard-errors
+# (`compile_error!`) if built for wasm32, so it's scoped out of that target
+# entirely — nobody runs `cargo bench` there anyway, only
+# `cargo test`/`wasm-pack test`, neither of which builds `benches/`.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
+# rand (a dev-dependency, used to build test/bench inputs) pulls in
+# getrandom transitively; getrandom needs an explicit entropy backend on
+# wasm32-unknown-unknown since there's no OS RNG to default to. Our tests
+# only ever use `StdRng::seed_from_u64` (deterministic, no entropy needed),
+# but getrandom still has to compile for the whole dependency graph.
+getrandom = { version = "0.2", features = ["js"] }
+
+[[bench]]
+name = "bench"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
