@@ -70,7 +70,8 @@ over whichever kernel gets selected:
 **Register-blocked micro-kernel.** The naive way to call `dot`/`axpy` is once
 per `(query_row, key_row)` pair — for a fixed query row, the whole `K`/`V`
 tile gets re-scanned from scratch, with zero register reuse across query
-rows. Two rounds of register blocking address this from both directions:
+rows. Three rounds of register blocking address this, tackling two distinct
+problems (load sharing and ILP/latency-hiding):
 
 - **QK^T** (`Kernel::dot4x4`): 4 query rows *and* 4 key rows blocked
   together (BLIS/OpenBLAS-style two-sided register tiling) — both operands'
@@ -80,16 +81,30 @@ rows. Two rounds of register blocking address this from both directions:
   leaving the four query-row vectors reloaded from memory on every key row;
   going two-sided measured a further ~1.5-1.6x on top of that (see
   Benchmarks).
-- **PV** (`Kernel::pv4`): the mirror-image inefficiency was on the
-  accumulator side, not the operand side — a naive "one `axpy` per V-row"
-  loop reads/writes the whole output accumulator through memory once per
-  V-row. `pv4` keeps each `d_head`-chunk's 4 accumulator registers resident
-  across the *entire* key/value sweep for a 4-query-row group, writing back
-  to memory only once per chunk — measured ~1.2x over the one-`axpy`-per-row
-  pattern.
+- **PV** (`Kernel::pv4`): a different inefficiency than QK^T's — a naive
+  "one `axpy` per V-row" loop reads/writes the whole output accumulator
+  through memory once per V-row. The first fix kept each `d_head`-chunk's
+  4 accumulator registers resident across the *entire* key/value sweep for
+  a 4-query-row group, writing back to memory only once per chunk (~1.2x).
+  That still left only 4 independent accumulator chains, each with a
+  sequential FMA dependency across the whole (often 128+) `bc` sweep — not
+  enough concurrent work to hide FMA latency (`dot4x4`, by contrast, has 16
+  chains, each only `d_head/4` iterations long). Doubling `pv4` to process
+  2 `d_head`-chunks per row (8 chains total) measured a further ~1.8-2.3x
+  on top of the first fix.
+- **Softmax bookkeeping** (`Kernel::max_reduce4`/`sub_exp_sum_inplace4`):
+  the same ILP problem, one level up — the online-softmax row-max and
+  subtract+exp+sum reductions were computed one row at a time, each a
+  single dependency chain over the row. Rows are mutually independent
+  within a tile (like PV's were), so interleaving 4 rows' reductions
+  measured ~1.8-2.5x over one-row-at-a-time.
 
-Both fall back to scalar-row/column handling (`dot4`, `dot`, plain `axpy`)
-for the `block_size_q % 4` / `block_size_kv % 4` remainders.
+All three fall back to scalar-row/column handling (`dot4`, `dot`, plain
+`axpy`/`max_reduce`/`sub_exp_sum_inplace`) for the `block_size_q % 4` /
+`block_size_kv % 4` remainders. `scale_inplace` (the third per-row softmax
+step) was checked and deliberately *not* row-blocked: it's a pure
+elementwise multiply with no accumulation dependency, so there's no latency
+chain to hide — already throughput-bound.
 
 | Kernel | File | Target | Lanes | Selection |
 |---|---|---|---|---|
@@ -175,7 +190,9 @@ its pipeline running zero, one, and multiple steady-state iterations.
 have their own kernel-level tests too (`exp_matches_std`,
 `dot_matches_scalar`, `reductions_match_scalar`,
 `axpy_and_scale_match_scalar`, `dot4_matches_four_dots`,
-`dot4x4_matches_naive`, `pv4_matches_naive`). 38 tests total (26 unit + 11
+`dot4x4_matches_naive`, `pv4_matches_naive`,
+`max_reduce4_matches_four_max_reduces`,
+`sub_exp_sum_inplace4_matches_four_calls`). 40 tests total (28 unit + 11
 integration + 1 doctest), all passing on this machine (aarch64 — the
 AVX2/AVX-512-specific tests are `#[cfg(target_arch = "x86_64")]`-gated and
 don't run here).
@@ -200,13 +217,15 @@ Correctness above for how that's verified). Reproduce with
 kernel will engage instead on x86_64 hardware, with its own numbers.
 `d_head=64` unless noted; times in ms.
 
-These numbers reflect a second round of optimization: a packed two-sided
-`Kernel::dot4x4` micro-kernel for QK^T and a register-resident `Kernel::pv4`
-for PV (see Design above), plus a fused subtract+`exp`+sum softmax pass —
-on top of round 1's `dot4`/`axpy4` blocking and `for_each_init` buffer reuse.
-Run-to-run variance on this shared dev laptop is real (repeated runs of the
-same binary vary by up to ~20-30%, likely thermal/background-load
-dependent) — the tables below are a representative run, and the
+These numbers reflect a third round of optimization: `Kernel::pv4` widened
+from 4 to 8 independent accumulator chains, and the online-softmax
+bookkeeping (`Kernel::max_reduce4`/`sub_exp_sum_inplace4`) row-blocked by 4
+for the same reason (see Design above) — on top of round 2's `dot4x4`/`pv4`
+and round 1's `dot4`/`axpy4`/`for_each_init`. Run-to-run variance on this
+shared dev laptop is real (repeated runs of the same binary vary by up to
+~20-30%, likely thermal/background-load dependent, and concurrent CPU load
+from other benchmarks running on the same machine measurably inflates
+numbers) — the tables below are from clean, uncontended runs, and the
 percentages in "Honest reading" are rounded accordingly rather than
 over-precise.
 
@@ -215,46 +234,51 @@ differences from Rayon's parallelism):
 
 | seq_len | naive | v1 | v2 | v3 | v1 causal | v2 causal | v3 causal |
 |--------:|------:|---:|---:|---:|----------:|----------:|----------:|
-|  256 |  1.51 |  0.44 |  0.40 |  0.39 |  0.41 |  0.29 |  0.28 |
-|  512 |  4.09 |  1.25 |  1.19 |  1.22 |  1.34 |  0.81 |  0.83 |
-| 1024 | 16.50 |  4.99 |  4.93 |  4.92 |  5.35 |  2.87 |  2.79 |
-| 2048 | 65.69 | 20.53 | 20.18 | 20.38 | 21.79 | 11.15 | 11.02 |
-| 1024 (d=128) | 38.17 |  9.44 |  9.36 |  9.33 |  9.69 |  5.25 |  5.31 |
+|  256 |  1.50 |  0.34 |  0.34 |  0.32 |  0.33 |  0.25 |  0.24 |
+|  512 |  4.11 |  0.95 |  0.95 |  0.95 |  1.02 |  0.62 |  0.63 |
+| 1024 | 15.95 |  3.79 |  3.82 |  3.92 |  4.09 |  2.25 |  2.17 |
+| 2048 | 63.16 | 15.45 | 15.49 | 15.73 | 16.40 |  8.30 |  8.44 |
+| 1024 (d=128) | 37.59 |  7.37 |  6.94 |  7.15 |  7.55 |  4.09 |  4.12 |
 
 **Default** (Rayon parallelism active across query blocks, all 10 cores):
 
 | seq_len | naive | v1 | v2 | v3 | v1 causal | v2 causal | v3 causal |
 |--------:|------:|---:|---:|---:|----------:|----------:|----------:|
-|  256 |  1.62 | 0.17 | 0.15 | 0.15 | 0.15 | 0.14 | 0.15 |
-|  512 |  4.13 | 0.35 | 0.34 | 0.35 | 0.36 | 0.31 | 0.28 |
-| 1024 | 16.92 | 1.08 | 1.12 | 1.06 | 1.12 | 0.73 | 0.62 |
-| 2048 | 66.42 | 3.53 | 3.69 | 3.56 | 3.88 | 2.00 | 2.04 |
-| 1024 (d=128) | 39.74 | 1.95 | 1.93 | 1.95 | 1.99 | 1.18 | 1.20 |
+|  256 |  1.60 | 0.13 | 0.14 | 0.13 | 0.13 | 0.12 | 0.13 |
+|  512 |  4.31 | 0.29 | 0.30 | 0.30 | 0.31 | 0.25 | 0.25 |
+| 1024 | 15.92 | 0.91 | 0.92 | 0.92 | 0.97 | 0.54 | 0.58 |
+| 2048 | 65.09 | 3.18 | 3.15 | 3.05 | 3.33 | 1.78 | 1.77 |
+| 1024 (d=128) | 43.67 | 1.52 | 1.58 | 1.59 | 1.58 | 0.91 | 1.07 |
 
 Cross-checked against `cargo bench` (Criterion, default threading) as a
-direct before/after on the same benchmark IDs: every `flash`/`v1`/`v3`
-case (causal and non-causal, `seq_len` 512-2048) came back **-15% to -25%
-time** ("Performance has improved", `p < 0.05`) versus the round-1
-baseline, while `naive` stayed flat (within ±3%, noise) — the pattern
-expected, since `naive_attention` doesn't use the `Kernel` trait and so
-isn't touched by any of this work.
+direct before/after on the same benchmark IDs: `flash`/`v1`/`v3` at
+`seq_len=2048` came back **-15.4%/-17.9%/-16.5% time** respectively
+(causal variants -17% to -25%), all `p < 0.05` ("Performance has
+improved"), while `naive` was flat (`p = 0.67`, "No change in performance
+detected") — the pattern expected, since `naive_attention` doesn't use the
+`Kernel` trait and so isn't touched by any of this work.
 
 **Honest reading of these numbers, on this hardware:**
 
-- **This round adds a further ~1.1-1.4x on top of round 1's already-large
-  win**, both single- and multi-threaded — smaller than the ~1.5-1.6x
-  (QK^T) and ~1.2x (PV) improvements measured in isolated micro-benchmarks
-  for the same change (see Design above), which is expected: QK^T and PV
-  are each a *fraction* of total tile time (softmax bookkeeping, causal
-  masking, and tiling overhead are unaffected by either change), so
-  Amdahl's law dilutes the isolated per-phase win once it's wired into the
-  full algorithm. Non-causal `v2` at `seq_len=2048` goes from ~2.8x over
-  naive (round 1) to ~3.3x single-threaded, and from ~15.5x to ~18x at the
-  default thread count.
+- **This round adds a further ~1.28-1.35x single-threaded and ~1.12-1.3x
+  default-threaded on top of round 2** — smaller than the ~1.8-2.3x (PV
+  widening) and ~1.8-2.5x (softmax row-blocking) improvements measured in
+  isolated micro-benchmarks for the same changes (see Design above), for
+  the same Amdahl's-law reason as round 2: each change speeds up one
+  *fraction* of total tile time, and the fractions that are already fast
+  (or unaffected, like causal masking and tiling overhead) don't shrink
+  further. Non-causal `v2` at `seq_len=2048` goes from ~3.3x over naive
+  (round 2) to ~4.1x single-threaded, and from ~18x to ~20.7x at the
+  default thread count. The default-threaded improvement is consistently
+  smaller than single-threaded across all three rounds so far — plausibly
+  because Rayon dispatch/scheduling overhead is a larger fraction of an
+  already-fast default-threaded call than of a single-threaded one, but
+  this hasn't been directly measured this round and shouldn't be taken as
+  confirmed.
 - **Causal, v2/v3 still add a further ~1.8-2x on top of v1/non-causal** —
   from skipping whole future KV tiles instead of computing and masking
   them. This remains the one asymptotic, unambiguous improvement in this
-  whole comparison, unaffected in kind by either round's micro-kernel work
+  whole comparison, unaffected in kind by any round's micro-kernel work
   (though it compounds with it).
 - **v3 vs v2 is still a wash on this hardware**, unchanged by this round —
   sometimes marginally faster, sometimes marginally slower, never by more
@@ -263,27 +287,17 @@ isn't touched by any of this work.
   guarantee of overlap. Don't take v3 on faith — measure it on your own
   target hardware.
 - Rayon parallelism (default vs. single-threaded columns) gives roughly a
-  5-5.5x multiplicative speedup at `seq_len=2048` on this 10-core machine,
+  4.9-5x multiplicative speedup at `seq_len=2048` on this 10-core machine,
   independent of and on top of the algorithmic/SIMD/micro-kernel
   differences above.
-- **x86_64 is now measured for the first time in this project's history**
-  (previously only cross-compiled/correctness-tested, never benchmarked):
-  GitHub Actions' `ubuntu-latest`/`windows-latest` runners confirm
-  `avx512f` is *not* present (only `avx2`+`fma`), so the AVX2 kernel is
-  what actually runs there in CI. The register-pressure worry raised
-  above (`dot4x4`'s 16 accumulators leave no spare AVX2 YMM registers,
-  vs. comfortable headroom on NEON/AVX-512's 32) turned out **not** to
-  bite in practice: real CI before/after numbers on both `ubuntu-latest`
-  and `windows-latest` show `v2`/`v3` at `seq_len=2048` roughly **1.4-1.6x
-  faster** than the round-1 (pre-`dot4x4`/`pv4`) AVX2 baseline —
-  proportionally *more* improvement than this round measured on the local
-  NEON dev machine (~1.1-1.4x), not less. Take this as directional rather
-  than precise (shared, noisy CI runners), but it's a real result, not an
-  assumption: whatever theoretical spill risk 16 accumulators pose on a
-  16-register file, it isn't showing up as a regression on the x86_64
-  hardware GitHub Actions actually assigns. See
+- **Real x86_64 CI numbers for this round** hadn't been fetched as this
+  section was written (the local NEON measurements above were the
+  priority to get right first) — see
   [the CI logs](https://github.com/amaye15/flash-attention-cpu/actions/workflows/ci.yml)
-  for the full numbers.
+  for the actual post-round-3 AVX2/AVX-512 numbers rather than assuming
+  they scale the same way NEON did; round 2 already showed a case (the
+  `dot4x4` register-pressure question) where the x86_64 result didn't
+  match the a priori expectation from the NEON measurement alone.
 
 **Note on the causal speedup**: it comes from skipping whole `K`/`V` tiles
 (v2/v3 only), so it scales with how many tiles are actually skippable — at

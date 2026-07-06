@@ -51,13 +51,18 @@ pub(crate) trait Kernel {
     /// `acc[r][i] += sum_j p[r][j] * v_block[j][i]` for `r` in `0..4`,
     /// where `v_block` is `bc` contiguous rows of `d_head` elements and
     /// `p[r]` is row `r`'s `bc` already-exp'd probabilities. Unlike a naive
-    /// "one `axpy` per V-row" loop, this keeps each `d_head`-chunk's 4
+    /// "one `axpy` per V-row" loop, this keeps each `d_head`-chunk's
     /// accumulator registers resident across the *entire* `bc` sweep,
     /// touching `acc` in memory only once per chunk instead of once per
     /// V-row — the PV-side analog of [`Kernel::dot4x4`]'s insight, just
     /// eliminating accumulator round-trips instead of operand reloads.
-    /// Measured ~1.2x throughput improvement over the previous
-    /// one-`axpy`-per-V-row pattern (see the crate's benchmarks).
+    /// Each implementation processes 2 native-width chunks (8 independent
+    /// accumulator chains) per outer step rather than 1 (4 chains): with
+    /// only 4 chains, each carrying a genuine sequential FMA dependency
+    /// across the whole (often 128+) `bc` sweep, there isn't enough
+    /// concurrent independent work to hide FMA latency — doubling the
+    /// chain count measured a further ~1.8-2.3x on top of the original
+    /// one-`axpy`-per-V-row pattern's ~1.2x (see the crate's benchmarks).
     unsafe fn pv4(acc: [&mut [f32]; 4], v_block: &[f32], p: [&[f32]; 4]);
 
     /// `dst[i] *= scale` for all `i`.
@@ -65,4 +70,19 @@ pub(crate) trait Kernel {
 
     /// Max over all elements. Empty slice returns `-inf`.
     unsafe fn max_reduce(x: &[f32]) -> f32;
+
+    /// `[max_reduce(x[0]), max_reduce(x[1]), max_reduce(x[2]), max_reduce(x[3])]`
+    /// — 4 independent max-reduction chains interleaved instead of 4
+    /// separate sequential calls. Rows are mutually independent within one
+    /// KV-tile (each row's max only depends on that row's own scores), but
+    /// a single row's `max_reduce` is one dependency chain over `bc/lanes`
+    /// iterations — often too short on its own to hide reduction latency,
+    /// the same class of problem [`Kernel::pv4`] has. Used for the bulk of
+    /// the online-softmax bookkeeping loop's row-max step, with the
+    /// existing [`Kernel::max_reduce`] as the `this_br % 4` remainder.
+    unsafe fn max_reduce4(x: [&[f32]; 4]) -> [f32; 4];
+
+    /// [`Kernel::sub_exp_sum_inplace`], 4 rows at once with per-row `m`
+    /// values interleaved for the same reason as [`Kernel::max_reduce4`].
+    unsafe fn sub_exp_sum_inplace4(x: [&mut [f32]; 4], m: [f32; 4]) -> [f32; 4];
 }

@@ -25,19 +25,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     QK^T bulk path, falling back to `dot4` for the `block_size_kv % 4`
     column remainder and to `dot` for the `block_size_q % 4` row remainder.
   - `Kernel::pv4`: PV accumulation for a 4-query-row group against a whole
-    KV tile, keeping each `d_head`-chunk's accumulator registers resident
-    across the entire key/value sweep and writing back to memory once per
-    chunk instead of once per key/value row (replaces the earlier
-    `axpy4`, which read/wrote the accumulator through memory on every row).
+    KV tile, keeping accumulator registers resident across the entire
+    key/value sweep and writing back to memory once per chunk instead of
+    once per key/value row (replaces the earlier `axpy4`, which read/wrote
+    the accumulator through memory on every row). Processes 2 native-width
+    chunks (8 independent accumulator chains) per outer step rather than 1
+    (4 chains): 4 chains isn't enough concurrent work to hide the FMA
+    latency of each row's long sequential `bc`-sweep dependency.
   - Implemented for all five kernels (scalar, AVX2, AVX-512F, NEON,
     SIMD128) and wired into `v1`/`v2`/`v3`. Each layer was validated first
     as an isolated NEON micro-benchmark before being wired in: `dot4`/`pv4`'s
     one-sided predecessor measured 1.74x/1.29x (`d_head=64`/`128`); `dot4x4`
-    measured a further ~1.5-1.6x over that, and `pv4` ~1.2x over a naive
-    one-`axpy`-per-row PV loop.
+    measured a further ~1.5-1.6x over that; `pv4`'s first (4-chain) version
+    measured ~1.2x over a naive one-`axpy`-per-row PV loop, and doubling to
+    8 chains measured a further ~1.8-2.3x on top of that.
 - `Kernel::sub_exp_sum_inplace` fuses the online-softmax subtract-max,
   `exp`, and sum-reduction into a single SIMD pass per kernel (previously
   three separate traversals of the score row: max, subtract+exp, sum).
+  `Kernel::max_reduce4`/`sub_exp_sum_inplace4` additionally row-block this
+  bookkeeping by 4 (the same ILP problem as `pv4`'s: one row's reduction is
+  a single dependency chain, and rows are mutually independent within a
+  tile), measured ~1.8-2.5x over one-row-at-a-time.
 - `tests/correctness.rs::block_size_q_not_a_multiple_of_four` and
   `::block_size_kv_not_a_multiple_of_four`, covering the register-blocked
   micro-kernel's row and column remainder paths.
@@ -52,12 +60,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   query block's scratch buffers (`m`/`l`/`acc`/scores) once per worker thread
   instead of once per block.
 - Measured net effect on this machine (Apple M4, aarch64, NEON kernel),
-  across both rounds of the above: roughly 3.3x single-threaded and 18x
-  default-multithreaded speedup over naive for `flash_attention_v2` at
-  `seq_len=2048` (up from ~1.5x/~8-9x before either round); `naive_attention`
-  is unaffected throughout (it doesn't use the `Kernel` trait). See the
-  README's Benchmarks section for full before/after tables and the
-  isolated-microbenchmark numbers behind each change.
+  across all three rounds of the above: roughly 4x single-threaded and
+  ~20.7x default-multithreaded speedup over naive for `flash_attention_v2`
+  at `seq_len=2048` (up from ~1.5x/~8-9x before any of these rounds);
+  `naive_attention` is unaffected throughout (it doesn't use the `Kernel`
+  trait). See the README's Benchmarks section for full before/after tables
+  and the isolated-microbenchmark numbers behind each change.
 
 ## [0.1.0]
 

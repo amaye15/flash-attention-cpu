@@ -49,6 +49,11 @@ impl Kernel for Avx2Kernel {
     }
 
     #[inline]
+    unsafe fn sub_exp_sum_inplace4(x: [&mut [f32]; 4], m: [f32; 4]) -> [f32; 4] {
+        sub_exp_sum_inplace4_avx2(x, m)
+    }
+
+    #[inline]
     unsafe fn axpy(dst: &mut [f32], src: &[f32], scale: f32) {
         axpy_avx2(dst, src, scale)
     }
@@ -66,6 +71,11 @@ impl Kernel for Avx2Kernel {
     #[inline]
     unsafe fn max_reduce(x: &[f32]) -> f32 {
         max_reduce_avx2(x)
+    }
+
+    #[inline]
+    unsafe fn max_reduce4(x: [&[f32]; 4]) -> [f32; 4] {
+        max_reduce4_avx2(x)
     }
 }
 
@@ -298,6 +308,52 @@ unsafe fn sub_exp_sum_inplace_avx2(x: &mut [f32], m: f32) -> f32 {
     sum
 }
 
+/// [`sub_exp_sum_inplace_avx2`], 4 rows at once with per-row `m` values,
+/// interleaved into 4 independent chains — see
+/// [`crate::kernel::Kernel::sub_exp_sum_inplace4`] for why.
+#[target_feature(enable = "avx2,fma")]
+unsafe fn sub_exp_sum_inplace4_avx2(x: [&mut [f32]; 4], m: [f32; 4]) -> [f32; 4] {
+    let [x0, x1, x2, x3] = x;
+    let len = x0.len();
+    debug_assert_eq!(x1.len(), len);
+    debug_assert_eq!(x2.len(), len);
+    debug_assert_eq!(x3.len(), len);
+    let vm = [
+        _mm256_set1_ps(m[0]),
+        _mm256_set1_ps(m[1]),
+        _mm256_set1_ps(m[2]),
+        _mm256_set1_ps(m[3]),
+    ];
+    let mut sum_acc = [_mm256_setzero_ps(); 4];
+    let mut i = 0usize;
+    while i + 8 <= len {
+        let r0 = exp256_ps(_mm256_sub_ps(_mm256_loadu_ps(x0.as_ptr().add(i)), vm[0]));
+        _mm256_storeu_ps(x0.as_mut_ptr().add(i), r0);
+        sum_acc[0] = _mm256_add_ps(sum_acc[0], r0);
+        let r1 = exp256_ps(_mm256_sub_ps(_mm256_loadu_ps(x1.as_ptr().add(i)), vm[1]));
+        _mm256_storeu_ps(x1.as_mut_ptr().add(i), r1);
+        sum_acc[1] = _mm256_add_ps(sum_acc[1], r1);
+        let r2 = exp256_ps(_mm256_sub_ps(_mm256_loadu_ps(x2.as_ptr().add(i)), vm[2]));
+        _mm256_storeu_ps(x2.as_mut_ptr().add(i), r2);
+        sum_acc[2] = _mm256_add_ps(sum_acc[2], r2);
+        let r3 = exp256_ps(_mm256_sub_ps(_mm256_loadu_ps(x3.as_ptr().add(i)), vm[3]));
+        _mm256_storeu_ps(x3.as_mut_ptr().add(i), r3);
+        sum_acc[3] = _mm256_add_ps(sum_acc[3], r3);
+        i += 8;
+    }
+    let mut sum: [f32; 4] = std::array::from_fn(|r| hsum256_ps(sum_acc[r]));
+    let rows: [&mut [f32]; 4] = [x0, x1, x2, x3];
+    while i < len {
+        for r in 0..4 {
+            let e = (rows[r][i] - m[r]).exp();
+            rows[r][i] = e;
+            sum[r] += e;
+        }
+        i += 1;
+    }
+    sum
+}
+
 #[target_feature(enable = "avx2,fma")]
 unsafe fn axpy_avx2(dst: &mut [f32], src: &[f32], scale: f32) {
     debug_assert_eq!(dst.len(), src.len());
@@ -318,9 +374,15 @@ unsafe fn axpy_avx2(dst: &mut [f32], src: &[f32], scale: f32) {
 }
 
 /// PV accumulation for a 4-row group against a whole KV tile, `d_head`-chunk
-/// outer / V-row inner: each chunk's 4 accumulator registers stay resident
+/// outer / V-row inner: each chunk's accumulator registers stay resident
 /// across the entire `bc` sweep and are written back to `acc` only once per
 /// chunk, instead of once per V-row — see [`crate::kernel::Kernel::pv4`].
+///
+/// Processes 2 lanes-of-8 (16 lanes, 8 independent accumulator chains) per
+/// outer step rather than 1 (4 chains): see `neon::pv4_neon`'s docs for why
+/// 4 chains isn't enough concurrent independent work to hide the FMA
+/// latency of each row's `bc`-long sequential accumulation. A single-chunk
+/// (4-chain) fallback handles one leftover lane-of-8, then a scalar tail.
 #[target_feature(enable = "avx2,fma")]
 unsafe fn pv4_avx2(acc: [&mut [f32]; 4], v_block: &[f32], p: [&[f32]; 4]) {
     let [a0, a1, a2, a3] = acc;
@@ -335,7 +397,44 @@ unsafe fn pv4_avx2(acc: [&mut [f32]; 4], v_block: &[f32], p: [&[f32]; 4]) {
     debug_assert_eq!(p[3].len(), bc);
 
     let mut chunk = 0usize;
-    while chunk + 8 <= d {
+    while chunk + 16 <= d {
+        let mut acc0a = _mm256_loadu_ps(a0.as_ptr().add(chunk));
+        let mut acc0b = _mm256_loadu_ps(a0.as_ptr().add(chunk + 8));
+        let mut acc1a = _mm256_loadu_ps(a1.as_ptr().add(chunk));
+        let mut acc1b = _mm256_loadu_ps(a1.as_ptr().add(chunk + 8));
+        let mut acc2a = _mm256_loadu_ps(a2.as_ptr().add(chunk));
+        let mut acc2b = _mm256_loadu_ps(a2.as_ptr().add(chunk + 8));
+        let mut acc3a = _mm256_loadu_ps(a3.as_ptr().add(chunk));
+        let mut acc3b = _mm256_loadu_ps(a3.as_ptr().add(chunk + 8));
+        let mut j = 0usize;
+        while j < bc {
+            let vva = _mm256_loadu_ps(v_block.as_ptr().add(j * d + chunk));
+            let vvb = _mm256_loadu_ps(v_block.as_ptr().add(j * d + chunk + 8));
+            let s0 = _mm256_set1_ps(p[0][j]);
+            let s1 = _mm256_set1_ps(p[1][j]);
+            let s2 = _mm256_set1_ps(p[2][j]);
+            let s3 = _mm256_set1_ps(p[3][j]);
+            acc0a = _mm256_fmadd_ps(vva, s0, acc0a);
+            acc0b = _mm256_fmadd_ps(vvb, s0, acc0b);
+            acc1a = _mm256_fmadd_ps(vva, s1, acc1a);
+            acc1b = _mm256_fmadd_ps(vvb, s1, acc1b);
+            acc2a = _mm256_fmadd_ps(vva, s2, acc2a);
+            acc2b = _mm256_fmadd_ps(vvb, s2, acc2b);
+            acc3a = _mm256_fmadd_ps(vva, s3, acc3a);
+            acc3b = _mm256_fmadd_ps(vvb, s3, acc3b);
+            j += 1;
+        }
+        _mm256_storeu_ps(a0.as_mut_ptr().add(chunk), acc0a);
+        _mm256_storeu_ps(a0.as_mut_ptr().add(chunk + 8), acc0b);
+        _mm256_storeu_ps(a1.as_mut_ptr().add(chunk), acc1a);
+        _mm256_storeu_ps(a1.as_mut_ptr().add(chunk + 8), acc1b);
+        _mm256_storeu_ps(a2.as_mut_ptr().add(chunk), acc2a);
+        _mm256_storeu_ps(a2.as_mut_ptr().add(chunk + 8), acc2b);
+        _mm256_storeu_ps(a3.as_mut_ptr().add(chunk), acc3a);
+        _mm256_storeu_ps(a3.as_mut_ptr().add(chunk + 8), acc3b);
+        chunk += 16;
+    }
+    if chunk + 8 <= d {
         let mut acc0 = _mm256_loadu_ps(a0.as_ptr().add(chunk));
         let mut acc1 = _mm256_loadu_ps(a1.as_ptr().add(chunk));
         let mut acc2 = _mm256_loadu_ps(a2.as_ptr().add(chunk));
@@ -407,6 +506,35 @@ unsafe fn max_reduce_avx2(x: &[f32]) -> f32 {
     let mut m = hmax256_ps(acc);
     while i < len {
         m = m.max(x[i]);
+        i += 1;
+    }
+    m
+}
+
+/// [`max_reduce_avx2`], 4 rows at once, interleaved into 4 independent
+/// chains — see [`crate::kernel::Kernel::max_reduce4`] for why.
+#[target_feature(enable = "avx2,fma")]
+unsafe fn max_reduce4_avx2(x: [&[f32]; 4]) -> [f32; 4] {
+    let len = x[0].len();
+    debug_assert_eq!(x[1].len(), len);
+    debug_assert_eq!(x[2].len(), len);
+    debug_assert_eq!(x[3].len(), len);
+    if len == 0 {
+        return [f32::NEG_INFINITY; 4];
+    }
+    let mut acc = [_mm256_set1_ps(f32::NEG_INFINITY); 4];
+    let mut i = 0usize;
+    while i + 8 <= len {
+        for r in 0..4 {
+            acc[r] = _mm256_max_ps(acc[r], _mm256_loadu_ps(x[r].as_ptr().add(i)));
+        }
+        i += 8;
+    }
+    let mut m: [f32; 4] = std::array::from_fn(|r| hmax256_ps(acc[r]));
+    while i < len {
+        for r in 0..4 {
+            m[r] = m[r].max(x[r][i]);
+        }
         i += 1;
     }
     m
@@ -529,7 +657,15 @@ mod tests {
         if !avx2_available() {
             return;
         }
-        for (bc, d) in [(0usize, 4usize), (1, 4), (3, 5), (4, 4), (5, 7), (17, 33)] {
+        for (bc, d) in [
+            (0usize, 4usize),
+            (1, 4),
+            (3, 5),
+            (4, 4),
+            (5, 7),
+            (17, 33),
+            (9, 27), // exercises all 3 internal tiers: 16-chunk + 8-chunk + scalar tail
+        ] {
             let v_block: Vec<f32> = (0..bc * d).map(|i| (i as f32 * 0.03).cos()).collect();
             let p: [Vec<f32>; 4] = std::array::from_fn(|r| {
                 (0..bc)
@@ -573,6 +709,65 @@ mod tests {
             let want_max: f32 = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let got_max = unsafe { max_reduce_avx2(&x) };
             assert_eq!(want_max, got_max, "len={len} max");
+        }
+    }
+
+    #[test]
+    fn max_reduce4_matches_four_max_reduces() {
+        if !avx2_available() {
+            return;
+        }
+        for len in [0usize, 1, 3, 4, 5, 7, 8, 9, 33] {
+            let mk =
+                |seed: f32| -> Vec<f32> { (0..len).map(|i| (i as f32 * seed).sin()).collect() };
+            let rows = [mk(0.11), mk(0.23), mk(0.37), mk(0.51)];
+            let want = [
+                unsafe { max_reduce_avx2(&rows[0]) },
+                unsafe { max_reduce_avx2(&rows[1]) },
+                unsafe { max_reduce_avx2(&rows[2]) },
+                unsafe { max_reduce_avx2(&rows[3]) },
+            ];
+            let got = unsafe { max_reduce4_avx2([&rows[0], &rows[1], &rows[2], &rows[3]]) };
+            assert_eq!(want, got, "len={len}");
+        }
+    }
+
+    #[test]
+    fn sub_exp_sum_inplace4_matches_four_calls() {
+        if !avx2_available() {
+            return;
+        }
+        for len in [0usize, 1, 3, 4, 5, 7, 8, 9, 33] {
+            let mk = |seed: f32| -> Vec<f32> {
+                (0..len).map(|i| (i as f32 * seed).sin() * 4.0).collect()
+            };
+            let m = [0.1f32, -0.3, 0.5, 0.0];
+
+            let mut want_rows = [mk(0.11), mk(0.23), mk(0.37), mk(0.51)];
+            let want_sums: [f32; 4] = std::array::from_fn(|r| unsafe {
+                sub_exp_sum_inplace_avx2(&mut want_rows[r], m[r])
+            });
+
+            let mut got_rows = [mk(0.11), mk(0.23), mk(0.37), mk(0.51)];
+            let [g0, g1, g2, g3] = &mut got_rows;
+            let got_sums = unsafe { sub_exp_sum_inplace4_avx2([g0, g1, g2, g3], m) };
+
+            for r in 0..4 {
+                assert!(
+                    (want_sums[r] - got_sums[r]).abs() < 1e-3 * (want_sums[r].abs() + 1.0),
+                    "len={len} r={r} sum want={} got={}",
+                    want_sums[r],
+                    got_sums[r]
+                );
+                for i in 0..len {
+                    assert!(
+                        (want_rows[r][i] - got_rows[r][i]).abs() < 1e-4,
+                        "len={len} r={r} i={i} want={} got={}",
+                        want_rows[r][i],
+                        got_rows[r][i]
+                    );
+                }
+            }
         }
     }
 

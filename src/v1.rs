@@ -240,13 +240,47 @@ fn run_v1<K: Kernel + Sync>(
                 }
 
                 // Online softmax update + per-step un-normalize round-trip,
-                // per row (the running m/l/acc-scale state is a genuine
-                // per-row sequential dependency) — but leaves the PV
-                // accumulation to the blocked pass below, and the
-                // re-normalize-by-new_l step to the pass after that, since
-                // neither depends on *other* rows, only this row's own
-                // already-finished state here.
-                for i in 0..this_br {
+                // 4 rows at a time via `max_reduce4`/`sub_exp_sum_inplace4`
+                // for the row-max/subtract+exp+sum reductions — see
+                // `v2.rs`'s identical split / `Kernel::max_reduce4`'s docs
+                // for why. The rest (correction, un-normalize scale, `l`
+                // update) stays per-row: already independent, nothing to
+                // interleave. Leaves the PV accumulation to the blocked
+                // pass below, and the re-normalize-by-new_l step to the
+                // pass after that, since neither depends on *other* rows,
+                // only this row's own already-finished state here.
+                let mut i = 0;
+                while i + 4 <= this_br {
+                    let mut chunks =
+                        scores_slice[i * this_bc..(i + 4) * this_bc].chunks_exact_mut(this_bc);
+                    let s0 = chunks.next().unwrap();
+                    let s1 = chunks.next().unwrap();
+                    let s2 = chunks.next().unwrap();
+                    let s3 = chunks.next().unwrap();
+
+                    let block_max = unsafe { K::max_reduce4([&*s0, &*s1, &*s2, &*s3]) };
+                    let new_m: [f32; 4] = std::array::from_fn(|r| m[i + r].max(block_max[r]));
+
+                    let block_sum = unsafe { K::sub_exp_sum_inplace4([s0, s1, s2, s3], new_m) };
+
+                    for r in 0..4 {
+                        let correction = (m[i + r] - new_m[r]).exp();
+                        let old_l = l[i + r];
+                        let new_l = correction * old_l + block_sum[r];
+
+                        let acc_row = &mut acc[(i + r) * d_head..(i + r + 1) * d_head];
+                        // Un-normalize the previous (already-normalized)
+                        // output by its old sum, apply the running-max
+                        // correction, in one fused scale — this is the
+                        // extra work v2 defers.
+                        unsafe { K::scale_inplace(acc_row, old_l * correction) };
+
+                        m[i + r] = new_m[r];
+                        l[i + r] = new_l;
+                    }
+                    i += 4;
+                }
+                while i < this_br {
                     let s_row = &mut scores_slice[i * this_bc..(i + 1) * this_bc];
                     let block_max = unsafe { K::max_reduce(s_row) };
                     let new_m = m[i].max(block_max);
@@ -258,13 +292,11 @@ fn run_v1<K: Kernel + Sync>(
                     let new_l = correction * old_l + block_sum;
 
                     let acc_row = &mut acc[i * d_head..(i + 1) * d_head];
-                    // Un-normalize the previous (already-normalized) output
-                    // by its old sum, apply the running-max correction, in
-                    // one fused scale — this is the extra work v2 defers.
                     unsafe { K::scale_inplace(acc_row, old_l * correction) };
 
                     m[i] = new_m;
                     l[i] = new_l;
+                    i += 1;
                 }
 
                 // PV accumulation, 4 rows at a time via `pv4` — see

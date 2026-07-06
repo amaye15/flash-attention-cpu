@@ -242,12 +242,42 @@ fn run_v2<K: Kernel + Sync>(
                     }
                 }
 
-                // Online softmax update: per row (the running m/l/acc-scale
-                // state genuinely is a per-row sequential dependency), but
-                // leaves the PV accumulation itself to the blocked pass
+                // Online softmax update, 4 rows at a time via `max_reduce4`/
+                // `sub_exp_sum_inplace4`: row-max and subtract+exp+sum
+                // reductions are interleaved across 4 independent chains
+                // instead of processed one row at a time — see
+                // `Kernel::max_reduce4`'s docs for why a single row's
+                // reduction doesn't have enough independent work on its own
+                // to hide latency. The rest (correction, `l` update,
+                // `scale_inplace`) stays per-row afterward: already
+                // independent and throughput-bound, nothing to interleave.
+                // Leaves the PV accumulation itself to the blocked pass
                 // below — `scores_slice` still holds each row's exp'd
                 // probabilities afterward, unchanged from before.
-                for i in 0..this_br {
+                let mut i = 0;
+                while i + 4 <= this_br {
+                    let mut chunks =
+                        scores_slice[i * this_bc..(i + 4) * this_bc].chunks_exact_mut(this_bc);
+                    let s0 = chunks.next().unwrap();
+                    let s1 = chunks.next().unwrap();
+                    let s2 = chunks.next().unwrap();
+                    let s3 = chunks.next().unwrap();
+
+                    let block_max = unsafe { K::max_reduce4([&*s0, &*s1, &*s2, &*s3]) };
+                    let new_m: [f32; 4] = std::array::from_fn(|r| m[i + r].max(block_max[r]));
+
+                    let block_sum = unsafe { K::sub_exp_sum_inplace4([s0, s1, s2, s3], new_m) };
+
+                    for r in 0..4 {
+                        let correction = (m[i + r] - new_m[r]).exp();
+                        l[i + r] = correction * l[i + r] + block_sum[r];
+                        let acc_row = &mut acc[(i + r) * d_head..(i + r + 1) * d_head];
+                        unsafe { K::scale_inplace(acc_row, correction) };
+                        m[i + r] = new_m[r];
+                    }
+                    i += 4;
+                }
+                while i < this_br {
                     let s_row = &mut scores_slice[i * this_bc..(i + 1) * this_bc];
                     let block_max = unsafe { K::max_reduce(s_row) };
                     let new_m = m[i].max(block_max);
@@ -261,6 +291,7 @@ fn run_v2<K: Kernel + Sync>(
                     unsafe { K::scale_inplace(acc_row, correction) };
 
                     m[i] = new_m;
+                    i += 1;
                 }
 
                 // PV accumulation, 4 rows at a time via `pv4`: each

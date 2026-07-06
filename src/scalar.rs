@@ -91,4 +91,23 @@ impl Kernel for ScalarKernel {
     unsafe fn max_reduce(x: &[f32]) -> f32 {
         x.iter().copied().fold(f32::NEG_INFINITY, f32::max)
     }
+
+    #[inline]
+    unsafe fn max_reduce4(x: [&[f32]; 4]) -> [f32; 4] {
+        // No ILP benefit possible without independent SIMD chains to
+        // interleave — this exists purely so call sites don't need an
+        // arch-specific branch.
+        std::array::from_fn(|r| Self::max_reduce(x[r]))
+    }
+
+    #[inline]
+    unsafe fn sub_exp_sum_inplace4(x: [&mut [f32]; 4], m: [f32; 4]) -> [f32; 4] {
+        let [x0, x1, x2, x3] = x;
+        [
+            Self::sub_exp_sum_inplace(x0, m[0]),
+            Self::sub_exp_sum_inplace(x1, m[1]),
+            Self::sub_exp_sum_inplace(x2, m[2]),
+            Self::sub_exp_sum_inplace(x3, m[3]),
+        ]
+    }
 }

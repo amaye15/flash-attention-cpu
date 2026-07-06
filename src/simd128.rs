@@ -53,6 +53,11 @@ impl Kernel for Simd128Kernel {
     }
 
     #[inline]
+    unsafe fn sub_exp_sum_inplace4(x: [&mut [f32]; 4], m: [f32; 4]) -> [f32; 4] {
+        sub_exp_sum_inplace4_simd128(x, m)
+    }
+
+    #[inline]
     unsafe fn axpy(dst: &mut [f32], src: &[f32], scale: f32) {
         axpy_simd128(dst, src, scale)
     }
@@ -70,6 +75,11 @@ impl Kernel for Simd128Kernel {
     #[inline]
     unsafe fn max_reduce(x: &[f32]) -> f32 {
         max_reduce_simd128(x)
+    }
+
+    #[inline]
+    unsafe fn max_reduce4(x: [&[f32]; 4]) -> [f32; 4] {
+        max_reduce4_simd128(x)
     }
 }
 
@@ -300,6 +310,64 @@ unsafe fn sub_exp_sum_inplace_simd128(x: &mut [f32], m: f32) -> f32 {
     sum
 }
 
+/// [`sub_exp_sum_inplace_simd128`], 4 rows at once with per-row `m` values,
+/// interleaved into 4 independent chains — see
+/// [`crate::kernel::Kernel::sub_exp_sum_inplace4`] for why.
+#[target_feature(enable = "simd128")]
+unsafe fn sub_exp_sum_inplace4_simd128(x: [&mut [f32]; 4], m: [f32; 4]) -> [f32; 4] {
+    let [x0, x1, x2, x3] = x;
+    let len = x0.len();
+    debug_assert_eq!(x1.len(), len);
+    debug_assert_eq!(x2.len(), len);
+    debug_assert_eq!(x3.len(), len);
+    let vm = [
+        f32x4_splat(m[0]),
+        f32x4_splat(m[1]),
+        f32x4_splat(m[2]),
+        f32x4_splat(m[3]),
+    ];
+    let mut sum_acc = [f32x4_splat(0.0); 4];
+    let mut i = 0usize;
+    while i + 4 <= len {
+        let r0 = exp128_ps(f32x4_sub(
+            v128_load(x0.as_ptr().add(i) as *const v128),
+            vm[0],
+        ));
+        v128_store(x0.as_mut_ptr().add(i) as *mut v128, r0);
+        sum_acc[0] = f32x4_add(sum_acc[0], r0);
+        let r1 = exp128_ps(f32x4_sub(
+            v128_load(x1.as_ptr().add(i) as *const v128),
+            vm[1],
+        ));
+        v128_store(x1.as_mut_ptr().add(i) as *mut v128, r1);
+        sum_acc[1] = f32x4_add(sum_acc[1], r1);
+        let r2 = exp128_ps(f32x4_sub(
+            v128_load(x2.as_ptr().add(i) as *const v128),
+            vm[2],
+        ));
+        v128_store(x2.as_mut_ptr().add(i) as *mut v128, r2);
+        sum_acc[2] = f32x4_add(sum_acc[2], r2);
+        let r3 = exp128_ps(f32x4_sub(
+            v128_load(x3.as_ptr().add(i) as *const v128),
+            vm[3],
+        ));
+        v128_store(x3.as_mut_ptr().add(i) as *mut v128, r3);
+        sum_acc[3] = f32x4_add(sum_acc[3], r3);
+        i += 4;
+    }
+    let mut sum: [f32; 4] = std::array::from_fn(|r| hsum128_ps(sum_acc[r]));
+    let rows: [&mut [f32]; 4] = [x0, x1, x2, x3];
+    while i < len {
+        for r in 0..4 {
+            let e = (rows[r][i] - m[r]).exp();
+            rows[r][i] = e;
+            sum[r] += e;
+        }
+        i += 1;
+    }
+    sum
+}
+
 #[target_feature(enable = "simd128")]
 unsafe fn axpy_simd128(dst: &mut [f32], src: &[f32], scale: f32) {
     debug_assert_eq!(dst.len(), src.len());
@@ -320,9 +388,17 @@ unsafe fn axpy_simd128(dst: &mut [f32], src: &[f32], scale: f32) {
 }
 
 /// PV accumulation for a 4-row group against a whole KV tile, `d_head`-chunk
-/// outer / V-row inner: each chunk's 4 accumulator registers stay resident
+/// outer / V-row inner: each chunk's accumulator registers stay resident
 /// across the entire `bc` sweep and are written back to `acc` only once per
 /// chunk, instead of once per V-row — see [`crate::kernel::Kernel::pv4`].
+///
+/// Processes 2 lanes-of-4 (8 lanes, 8 independent accumulator chains) per
+/// outer step rather than 1 (4 chains): see `neon::pv4_neon`'s docs for why
+/// 4 chains isn't enough concurrent independent work to hide the FMA
+/// latency of each row's `bc`-long sequential accumulation (no native FMA
+/// here — see module docs — but the same latency-hiding logic applies to
+/// the separate mul+add). A single-chunk (4-chain) fallback handles one
+/// leftover lane-of-4, then a scalar tail.
 #[target_feature(enable = "simd128")]
 unsafe fn pv4_simd128(acc: [&mut [f32]; 4], v_block: &[f32], p: [&[f32]; 4]) {
     let [a0, a1, a2, a3] = acc;
@@ -337,7 +413,44 @@ unsafe fn pv4_simd128(acc: [&mut [f32]; 4], v_block: &[f32], p: [&[f32]; 4]) {
     debug_assert_eq!(p[3].len(), bc);
 
     let mut chunk = 0usize;
-    while chunk + 4 <= d {
+    while chunk + 8 <= d {
+        let mut acc0a = v128_load(a0.as_ptr().add(chunk) as *const v128);
+        let mut acc0b = v128_load(a0.as_ptr().add(chunk + 4) as *const v128);
+        let mut acc1a = v128_load(a1.as_ptr().add(chunk) as *const v128);
+        let mut acc1b = v128_load(a1.as_ptr().add(chunk + 4) as *const v128);
+        let mut acc2a = v128_load(a2.as_ptr().add(chunk) as *const v128);
+        let mut acc2b = v128_load(a2.as_ptr().add(chunk + 4) as *const v128);
+        let mut acc3a = v128_load(a3.as_ptr().add(chunk) as *const v128);
+        let mut acc3b = v128_load(a3.as_ptr().add(chunk + 4) as *const v128);
+        let mut j = 0usize;
+        while j < bc {
+            let vva = v128_load(v_block.as_ptr().add(j * d + chunk) as *const v128);
+            let vvb = v128_load(v_block.as_ptr().add(j * d + chunk + 4) as *const v128);
+            let s0 = f32x4_splat(p[0][j]);
+            let s1 = f32x4_splat(p[1][j]);
+            let s2 = f32x4_splat(p[2][j]);
+            let s3 = f32x4_splat(p[3][j]);
+            acc0a = f32x4_add(acc0a, f32x4_mul(vva, s0));
+            acc0b = f32x4_add(acc0b, f32x4_mul(vvb, s0));
+            acc1a = f32x4_add(acc1a, f32x4_mul(vva, s1));
+            acc1b = f32x4_add(acc1b, f32x4_mul(vvb, s1));
+            acc2a = f32x4_add(acc2a, f32x4_mul(vva, s2));
+            acc2b = f32x4_add(acc2b, f32x4_mul(vvb, s2));
+            acc3a = f32x4_add(acc3a, f32x4_mul(vva, s3));
+            acc3b = f32x4_add(acc3b, f32x4_mul(vvb, s3));
+            j += 1;
+        }
+        v128_store(a0.as_mut_ptr().add(chunk) as *mut v128, acc0a);
+        v128_store(a0.as_mut_ptr().add(chunk + 4) as *mut v128, acc0b);
+        v128_store(a1.as_mut_ptr().add(chunk) as *mut v128, acc1a);
+        v128_store(a1.as_mut_ptr().add(chunk + 4) as *mut v128, acc1b);
+        v128_store(a2.as_mut_ptr().add(chunk) as *mut v128, acc2a);
+        v128_store(a2.as_mut_ptr().add(chunk + 4) as *mut v128, acc2b);
+        v128_store(a3.as_mut_ptr().add(chunk) as *mut v128, acc3a);
+        v128_store(a3.as_mut_ptr().add(chunk + 4) as *mut v128, acc3b);
+        chunk += 8;
+    }
+    if chunk + 4 <= d {
         let mut acc0 = v128_load(a0.as_ptr().add(chunk) as *const v128);
         let mut acc1 = v128_load(a1.as_ptr().add(chunk) as *const v128);
         let mut acc2 = v128_load(a2.as_ptr().add(chunk) as *const v128);
@@ -409,6 +522,35 @@ unsafe fn max_reduce_simd128(x: &[f32]) -> f32 {
     let mut m = hmax128_ps(acc);
     while i < len {
         m = m.max(x[i]);
+        i += 1;
+    }
+    m
+}
+
+/// [`max_reduce_simd128`], 4 rows at once, interleaved into 4 independent
+/// chains — see [`crate::kernel::Kernel::max_reduce4`] for why.
+#[target_feature(enable = "simd128")]
+unsafe fn max_reduce4_simd128(x: [&[f32]; 4]) -> [f32; 4] {
+    let len = x[0].len();
+    debug_assert_eq!(x[1].len(), len);
+    debug_assert_eq!(x[2].len(), len);
+    debug_assert_eq!(x[3].len(), len);
+    if len == 0 {
+        return [f32::NEG_INFINITY; 4];
+    }
+    let mut acc = [f32x4_splat(f32::NEG_INFINITY); 4];
+    let mut i = 0usize;
+    while i + 4 <= len {
+        for r in 0..4 {
+            acc[r] = f32x4_max(acc[r], v128_load(x[r].as_ptr().add(i) as *const v128));
+        }
+        i += 4;
+    }
+    let mut m: [f32; 4] = std::array::from_fn(|r| hmax128_ps(acc[r]));
+    while i < len {
+        for r in 0..4 {
+            m[r] = m[r].max(x[r][i]);
+        }
         i += 1;
     }
     m
@@ -514,7 +656,15 @@ mod tests {
 
     #[test]
     fn pv4_matches_naive() {
-        for (bc, d) in [(0usize, 4usize), (1, 4), (3, 5), (4, 4), (5, 7), (17, 33)] {
+        for (bc, d) in [
+            (0usize, 4usize),
+            (1, 4),
+            (3, 5),
+            (4, 4),
+            (5, 7),
+            (17, 33),
+            (9, 13), // exercises all 3 internal tiers: 8-chunk + 4-chunk + scalar tail
+        ] {
             let v_block: Vec<f32> = (0..bc * d).map(|i| (i as f32 * 0.03).cos()).collect();
             let p: [Vec<f32>; 4] = std::array::from_fn(|r| {
                 (0..bc)
@@ -555,6 +705,59 @@ mod tests {
             let want_max: f32 = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let got_max = unsafe { max_reduce_simd128(&x) };
             assert_eq!(want_max, got_max, "len={len} max");
+        }
+    }
+
+    #[test]
+    fn max_reduce4_matches_four_max_reduces() {
+        for len in [0usize, 1, 3, 4, 5, 7, 8, 9, 33] {
+            let mk =
+                |seed: f32| -> Vec<f32> { (0..len).map(|i| (i as f32 * seed).sin()).collect() };
+            let rows = [mk(0.11), mk(0.23), mk(0.37), mk(0.51)];
+            let want = [
+                unsafe { max_reduce_simd128(&rows[0]) },
+                unsafe { max_reduce_simd128(&rows[1]) },
+                unsafe { max_reduce_simd128(&rows[2]) },
+                unsafe { max_reduce_simd128(&rows[3]) },
+            ];
+            let got = unsafe { max_reduce4_simd128([&rows[0], &rows[1], &rows[2], &rows[3]]) };
+            assert_eq!(want, got, "len={len}");
+        }
+    }
+
+    #[test]
+    fn sub_exp_sum_inplace4_matches_four_calls() {
+        for len in [0usize, 1, 3, 4, 5, 7, 8, 9, 33] {
+            let mk = |seed: f32| -> Vec<f32> {
+                (0..len).map(|i| (i as f32 * seed).sin() * 4.0).collect()
+            };
+            let m = [0.1f32, -0.3, 0.5, 0.0];
+
+            let mut want_rows = [mk(0.11), mk(0.23), mk(0.37), mk(0.51)];
+            let want_sums: [f32; 4] = std::array::from_fn(|r| unsafe {
+                sub_exp_sum_inplace_simd128(&mut want_rows[r], m[r])
+            });
+
+            let mut got_rows = [mk(0.11), mk(0.23), mk(0.37), mk(0.51)];
+            let [g0, g1, g2, g3] = &mut got_rows;
+            let got_sums = unsafe { sub_exp_sum_inplace4_simd128([g0, g1, g2, g3], m) };
+
+            for r in 0..4 {
+                assert!(
+                    (want_sums[r] - got_sums[r]).abs() < 1e-3 * (want_sums[r].abs() + 1.0),
+                    "len={len} r={r} sum want={} got={}",
+                    want_sums[r],
+                    got_sums[r]
+                );
+                for i in 0..len {
+                    assert!(
+                        (want_rows[r][i] - got_rows[r][i]).abs() < 1e-4,
+                        "len={len} r={r} i={i} want={} got={}",
+                        want_rows[r][i],
+                        got_rows[r][i]
+                    );
+                }
+            }
         }
     }
 
