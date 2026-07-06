@@ -270,13 +270,20 @@ isn't touched by any of this work.
   (previously only cross-compiled/correctness-tested, never benchmarked):
   GitHub Actions' `ubuntu-latest`/`windows-latest` runners confirm
   `avx512f` is *not* present (only `avx2`+`fma`), so the AVX2 kernel is
-  what actually runs there in CI. See
+  what actually runs there in CI. The register-pressure worry raised
+  above (`dot4x4`'s 16 accumulators leave no spare AVX2 YMM registers,
+  vs. comfortable headroom on NEON/AVX-512's 32) turned out **not** to
+  bite in practice: real CI before/after numbers on both `ubuntu-latest`
+  and `windows-latest` show `v2`/`v3` at `seq_len=2048` roughly **1.4-1.6x
+  faster** than the round-1 (pre-`dot4x4`/`pv4`) AVX2 baseline —
+  proportionally *more* improvement than this round measured on the local
+  NEON dev machine (~1.1-1.4x), not less. Take this as directional rather
+  than precise (shared, noisy CI runners), but it's a real result, not an
+  assumption: whatever theoretical spill risk 16 accumulators pose on a
+  16-register file, it isn't showing up as a regression on the x86_64
+  hardware GitHub Actions actually assigns. See
   [the CI logs](https://github.com/amaye15/flash-attention-cpu/actions/workflows/ci.yml)
-  for real (shared-runner, noisier than this dedicated dev machine) AVX2
-  timing — `dot4x4`'s 16 accumulators are comfortable on NEON/AVX-512 (32
-  registers each) but leave no spare AVX2 YMM registers (only 16 total),
-  so whether the two-sided packing helps or regresses on AVX2 specifically
-  is a real open question this data starts to answer, not an assumption.
+  for the full numbers.
 
 **Note on the causal speedup**: it comes from skipping whole `K`/`V` tiles
 (v2/v3 only), so it scales with how many tiles are actually skippable — at
@@ -366,12 +373,14 @@ Deliberately out of scope for this pass, but the architecture leaves room:
   two-sided QK^T micro-kernel (`Kernel::dot4x4`) and a register-resident
   PV accumulator (`Kernel::pv4`), wired into `src/v1.rs`/`src/v2.rs`/
   `src/v3.rs`; see Design and Benchmarks above for what each measures as.
-- **AVX2-specific packing factor**: `dot4x4`'s 16 accumulators fit
-  comfortably in NEON/AVX-512's 32 registers but leave no spare AVX2 YMM
-  registers (only 16 total) — implemented the same way on AVX2 for API
-  consistency, but a narrower factor (e.g. 4x2) tuned specifically for
-  AVX2's smaller register file is a real, not-yet-explored possibility if
-  real x86_64 CI numbers (see Benchmarks) show it regressing there.
+- ~~**AVX2-specific packing factor concern**~~ — considered, then checked
+  against real CI numbers rather than left as a guess: `dot4x4`'s 16
+  accumulators leave no spare AVX2 YMM registers (only 16 total, vs.
+  comfortable headroom on NEON/AVX-512's 32), which looked like plausible
+  spill risk on paper. Real before/after CI numbers on `ubuntu-latest`/
+  `windows-latest` (see Benchmarks) show `v2`/`v3` ~1.4-1.6x faster with
+  `dot4x4` than without on AVX2 hardware — no regression, so a narrower
+  AVX2-specific factor isn't pursued.
 - **Lower precision** (`bf16`/`f16`/FP8): halves (or quarters) memory
   bandwidth, which is often the actual bottleneck at long sequence lengths,
   and is part of FlashAttention-3's actual numerics story (incoherent

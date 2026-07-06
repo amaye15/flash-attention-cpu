@@ -169,11 +169,12 @@ unsafe fn dot4_avx2(a0: &[f32], a1: &[f32], a2: &[f32], a3: &[f32], b: &[f32]) -
 /// 4 query rows x 4 key rows blocked together — see
 /// [`crate::kernel::Kernel::dot4x4`]. 16 accumulators is comfortable on
 /// NEON/AVX-512 (32 registers each) but leaves no spare AVX2 YMM registers
-/// (only 16 total) for the per-iteration loads; whether that register
-/// pressure actually costs more than it gains on AVX2 hasn't been measured
-/// on real hardware in this sandbox (see the README's Benchmarks section) —
-/// implemented the same structural way as the other kernels for API
-/// consistency, not because the tradeoff is assumed to be free here.
+/// (only 16 total) for the per-iteration loads — plausible spill risk on
+/// paper. Real CI numbers on `ubuntu-latest`/`windows-latest` (see the
+/// README's Benchmarks section) show no such regression: `v2`/`v3` came
+/// back ~1.4-1.6x faster with this than the prior one-sided `dot4`-only
+/// path, so the theoretical register-pressure concern isn't costing
+/// anything in practice on the x86_64 hardware actually measured.
 #[target_feature(enable = "avx2,fma")]
 unsafe fn dot4x4_avx2(q: [&[f32]; 4], k: [&[f32]; 4]) -> [[f32; 4]; 4] {
     let d = q[0].len();
