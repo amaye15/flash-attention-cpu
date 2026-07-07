@@ -50,6 +50,8 @@
 //! flash_attention(&q, &k, &v, seq_len, seq_len, d_head, &FlashAttentionConfig::default(), &mut out);
 //! ```
 
+#![warn(missing_docs)]
+
 #[cfg(target_arch = "x86_64")]
 mod avx2;
 #[cfg(target_arch = "x86_64")]

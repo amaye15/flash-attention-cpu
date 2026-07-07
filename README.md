@@ -180,7 +180,14 @@ v3, whose arithmetic is byte-for-byte identical per row), plus
 `block_size_q_not_a_multiple_of_four` and `block_size_kv_not_a_multiple_of_four`
 tests specifically exercising the register-blocked micro-kernel's
 row/column remainder paths (1, 2, and 3 leftover rows or columns) with
-`block_size_q`/`block_size_kv` values that aren't multiples of 4.
+`block_size_q`/`block_size_kv` values that aren't multiples of 4, plus
+tests for the documented edge cases: `shape_mismatches_panic`/
+`multihead_shape_mismatch_panics` (every `# Panics` contract actually
+panics, not just documents that it should), `zero_sized_dimensions_leave_out_untouched`
+(`seq_len_q`/`seq_len_k`/`d_head == 0` each independently hit the early-return
+path without touching `out`), and `zero_block_size_is_clamped`
+(`block_size_q`/`block_size_kv: 0` degrade to a working, correct
+`block_size` of 1 rather than a division-by-zero or silent wrong answer).
 `src/v1.rs`, `src/v2.rs`, and `src/v3.rs` each additionally have internal
 tests that call the scalar, AVX2, AVX-512F, NEON, and SIMD128 kernels
 directly (bypassing dispatch), so every path is checked regardless of which
@@ -192,7 +199,7 @@ have their own kernel-level tests too (`exp_matches_std`,
 `axpy_and_scale_match_scalar`, `dot4_matches_four_dots`,
 `dot4x4_matches_naive`, `pv4_matches_naive`,
 `max_reduce4_matches_four_max_reduces`,
-`sub_exp_sum_inplace4_matches_four_calls`). 40 tests total (28 unit + 11
+`sub_exp_sum_inplace4_matches_four_calls`). 44 tests total (28 unit + 15
 integration + 1 doctest), all passing on this machine (aarch64 — the
 AVX2/AVX-512-specific tests are `#[cfg(target_arch = "x86_64")]`-gated and
 don't run here).

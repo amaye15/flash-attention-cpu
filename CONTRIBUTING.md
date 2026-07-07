@@ -38,14 +38,32 @@ loudly if that ever silently stops being true.
 
 ## Adding a new SIMD kernel
 
-Each kernel implements the small `Kernel` trait in `src/kernel.rs` (dot
-product, axpy, in-place scale, max/sum reduction, a vectorized `exp`) — see
-any of the four existing kernels for the pattern, and `src/avx2.rs`'s module
-docs for the vectorized-`exp` algorithm all of them share (range-reduction +
-degree-5 minimax polynomial + direct IEEE-754 exponent-bit reconstruction).
-Wire the new kernel into `v1.rs`/`v2.rs`/`v3.rs`'s dispatch chains (all
-three, identically) and `src/lib.rs`'s module declarations, matching the
-existing `#[cfg(...)]` pattern for whichever target it's for.
+Each kernel implements the `Kernel` trait in `src/kernel.rs` — see that
+file's doc comments for the full, current contract (it's grown across three
+rounds of performance work, so trust the trait definition over any summary
+here). Three families of primitives, in increasing implementation effort:
+
+- **Scalar**: `dot`, `axpy`, `scale_inplace`, `max_reduce` — one element at
+  a time, no SIMD-specific logic.
+- **One-sided register-blocked** (`dot4`, `sub_exp_sum_inplace`): 4
+  query-rows-at-once / a fused subtract+exp+sum pass, respectively.
+- **Packed/row-blocked** (`dot4x4`, `pv4`, `max_reduce4`,
+  `sub_exp_sum_inplace4`): two-sided register tiling for QK^T, a
+  register-resident accumulator for PV, and 4-row-interleaved reductions for
+  the softmax bookkeeping loop — see `src/kernel.rs`'s doc comments on each
+  for why (in short: sharing operand loads across output rows/columns, and
+  giving the CPU enough independent accumulator chains to hide FMA/reduction
+  latency).
+
+See any of the five existing kernels (`scalar.rs`/`avx2.rs`/`avx512.rs`/
+`neon.rs`/`simd128.rs`) for the pattern — they're structurally identical
+modulo lane width and FMA-argument-order conventions — and `src/avx2.rs`'s
+module docs for the vectorized-`exp` algorithm all of them share
+(range-reduction + degree-5 minimax polynomial + direct IEEE-754
+exponent-bit reconstruction). Wire the new kernel into `v1.rs`/`v2.rs`/
+`v3.rs`'s dispatch chains (all three, identically) and `src/lib.rs`'s module
+declarations, matching the existing `#[cfg(...)]` pattern for whichever
+target it's for.
 
 ## Algorithmic changes
 

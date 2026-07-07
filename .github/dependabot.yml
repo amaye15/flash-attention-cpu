@@ -1,0 +1,30 @@
+version: 2
+updates:
+  # Cargo dependencies (including transitive advisory-driven bumps like the
+  # crossbeam-epoch/RUSTSEC-2026-0204 one cargo-deny caught after the fact —
+  # this is what should open that PR proactively next time instead).
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      minor-and-patch:
+        update-types: ["minor", "patch"]
+    open-pull-requests-limit: 10
+
+  # The fuzz/ directory is its own Cargo workspace with its own Cargo.lock.
+  - package-ecosystem: "cargo"
+    directory: "/fuzz"
+    schedule:
+      interval: "weekly"
+    groups:
+      minor-and-patch:
+        update-types: ["minor", "patch"]
+    open-pull-requests-limit: 5
+
+  # Keep the CI workflow's third-party Actions (checkout, rust-toolchain,
+  # rust-cache, cargo-deny-action, setup-node) current too.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

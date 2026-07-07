@@ -373,3 +373,165 @@ fn v1_v2_v3_mutually_agree() {
         );
     }
 }
+
+/// Runs `f`, asserting it panics — with the default panic hook suppressed
+/// so an *expected* panic doesn't spam stderr during a normal test run.
+/// `AssertUnwindSafe` is fine here: every caller only inspects freshly
+/// created local buffers after the call, never anything the closure could
+/// have left in a torn state.
+fn assert_panics<F: FnOnce()>(f: F, context: &str) {
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    std::panic::set_hook(prev_hook);
+    assert!(
+        result.is_err(),
+        "{context}: expected a panic, but none occurred"
+    );
+}
+
+/// Every public entry point documents a `# Panics` contract (shape
+/// mismatches assert) — this actually exercises it, for all three variants,
+/// rather than just trusting the doc comment.
+#[test]
+fn shape_mismatches_panic() {
+    let (seq_q, seq_k, d) = (4usize, 4usize, 8usize);
+    let config = FlashAttentionConfig::default();
+    let q = random_vec(seq_q * d, 1);
+    let k = random_vec(seq_k * d, 2);
+    let v = random_vec(seq_k * d, 3);
+    let out_len = seq_q * d;
+
+    for variant in ALL_VARIANTS {
+        let bad_q = &q[..q.len() - 1];
+        let mut out = vec![0.0f32; out_len];
+        assert_panics(
+            || run_flash(variant, bad_q, &k, &v, seq_q, seq_k, d, &config, &mut out),
+            &format!("{variant:?}: q shape mismatch"),
+        );
+
+        let bad_k = &k[..k.len() - 1];
+        let mut out = vec![0.0f32; out_len];
+        assert_panics(
+            || run_flash(variant, &q, bad_k, &v, seq_q, seq_k, d, &config, &mut out),
+            &format!("{variant:?}: k shape mismatch"),
+        );
+
+        let bad_v = &v[..v.len() - 1];
+        let mut out = vec![0.0f32; out_len];
+        assert_panics(
+            || run_flash(variant, &q, &k, bad_v, seq_q, seq_k, d, &config, &mut out),
+            &format!("{variant:?}: v shape mismatch"),
+        );
+
+        let mut bad_out = vec![0.0f32; out_len - 1];
+        assert_panics(
+            || run_flash(variant, &q, &k, &v, seq_q, seq_k, d, &config, &mut bad_out),
+            &format!("{variant:?}: out shape mismatch"),
+        );
+    }
+}
+
+/// Same contract, batched multi-head entry points: a `q`/`batch`/`heads`
+/// mismatch against the `[batch, heads, seq, d_head]` layout must panic
+/// rather than silently reading/writing out of bounds.
+#[test]
+fn multihead_shape_mismatch_panics() {
+    let (batch, heads, seq_q, seq_k, d) = (2usize, 2usize, 4usize, 4usize, 8usize);
+    let config = FlashAttentionConfig::default();
+    let q = random_vec(batch * heads * seq_q * d, 1);
+    let k = random_vec(batch * heads * seq_k * d, 2);
+    let v = random_vec(batch * heads * seq_k * d, 3);
+    let out_len = batch * heads * seq_q * d;
+
+    for variant in ALL_VARIANTS {
+        let bad_q = &q[..q.len() - 1];
+        let mut out = vec![0.0f32; out_len];
+        assert_panics(
+            || {
+                run_multihead(
+                    variant, bad_q, &k, &v, batch, heads, seq_q, seq_k, d, &config, &mut out,
+                )
+            },
+            &format!("{variant:?}: multihead q shape mismatch"),
+        );
+    }
+}
+
+/// `common::check_shapes` early-returns for any zero-sized dimension
+/// without touching `out` at all — this confirms that's actually true
+/// (rather than e.g. zeroing `out`, or panicking) for each dimension
+/// independently, across all three variants.
+#[test]
+fn zero_sized_dimensions_leave_out_untouched() {
+    let d_head = 8usize;
+    let config = FlashAttentionConfig::default();
+    let sentinel = 12.5f32;
+
+    for variant in ALL_VARIANTS {
+        // seq_len_q == 0: q and out are (correctly) empty per the shape
+        // contract; nothing to assert beyond "doesn't panic".
+        let q: Vec<f32> = vec![];
+        let k = random_vec(4 * d_head, 2);
+        let v = random_vec(4 * d_head, 3);
+        let mut out: Vec<f32> = vec![];
+        run_flash(variant, &q, &k, &v, 0, 4, d_head, &config, &mut out);
+        assert!(
+            out.is_empty(),
+            "{variant:?}: seq_len_q=0 must keep out empty"
+        );
+
+        // seq_len_k == 0: k/v are empty, but out (seq_len_q=4 rows) is not —
+        // the early return must leave it completely untouched.
+        let q2 = random_vec(4 * d_head, 4);
+        let k2: Vec<f32> = vec![];
+        let v2: Vec<f32> = vec![];
+        let mut out2 = vec![sentinel; 4 * d_head];
+        run_flash(variant, &q2, &k2, &v2, 4, 0, d_head, &config, &mut out2);
+        assert!(
+            out2.iter().all(|&x| x == sentinel),
+            "{variant:?}: seq_len_k=0 must leave out untouched, got {out2:?}"
+        );
+
+        // d_head == 0: every buffer is (correctly) empty; just confirm no panic.
+        let q3: Vec<f32> = vec![];
+        let k3: Vec<f32> = vec![];
+        let v3: Vec<f32> = vec![];
+        let mut out3: Vec<f32> = vec![];
+        run_flash(variant, &q3, &k3, &v3, 4, 4, 0, &config, &mut out3);
+        assert!(out3.is_empty(), "{variant:?}: d_head=0 must keep out empty");
+    }
+}
+
+/// `block_size_q`/`block_size_kv: 0` are clamped to 1 via `.max(1)` rather
+/// than causing a division-by-zero or degenerate tiling — confirm the
+/// clamp actually produces a correct (if slow) result, not just that it
+/// compiles.
+#[test]
+fn zero_block_size_is_clamped() {
+    let (seq_q, seq_k, d) = (23usize, 29usize, 16usize);
+    let q = random_vec(seq_q * d, 1);
+    let k = random_vec(seq_k * d, 2);
+    let v = random_vec(seq_k * d, 3);
+
+    for variant in ALL_VARIANTS {
+        for causal in [false, true] {
+            let config = FlashAttentionConfig {
+                block_size_q: 0,
+                block_size_kv: 0,
+                causal,
+            };
+            let mut out = vec![0.0f32; seq_q * d];
+            run_flash(variant, &q, &k, &v, seq_q, seq_k, d, &config, &mut out);
+
+            let mut out_naive = vec![0.0f32; seq_q * d];
+            naive_attention(&q, &k, &v, seq_q, seq_k, d, causal, &mut out_naive);
+
+            let diff = max_abs_diff(&out, &out_naive);
+            assert!(
+                diff < 1e-3,
+                "{variant:?} causal={causal}: block_size=0 clamp diff {diff}"
+            );
+        }
+    }
+}

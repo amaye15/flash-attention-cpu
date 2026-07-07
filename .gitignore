@@ -3,3 +3,8 @@
 /fuzz/target
 /fuzz/corpus
 /fuzz/artifacts
+
+# Local Claude Code assistant state (scheduled-task locks, etc.) — machine-
+# specific, not source, and must never end up in the published crate
+# package (cargo's default packaging includes anything not git-ignored).
+/.claude/

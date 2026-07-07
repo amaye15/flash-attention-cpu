@@ -53,6 +53,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   diagnostic) on every `test` job leg, giving real — if noisier,
   shared-runner — x86_64 (AVX2/AVX-512F) and second-aarch64 timing data for
   the first time in this project's history.
+- `tests/correctness.rs`: `shape_mismatches_panic` and
+  `multihead_shape_mismatch_panics` actually exercise the `# Panics`
+  contract every public entry point documents (previously asserted only in
+  doc comments, never in a test); `zero_sized_dimensions_leave_out_untouched`
+  covers `seq_len_q`/`seq_len_k`/`d_head == 0` each independently;
+  `zero_block_size_is_clamped` confirms `block_size_q`/`block_size_kv: 0`
+  degrade to a correct (if slow) `block_size` of 1 rather than a
+  division-by-zero or silently wrong output.
+- `#![warn(missing_docs)]` at the crate root — coverage was already
+  complete (confirmed via `RUSTFLAGS="-W missing_docs" cargo build --lib`,
+  natively and cross-compiled to `x86_64-apple-darwin`, both clean), this
+  just guards against future regressions.
+- CI: a `cargo doc --no-deps --lib` step (`RUSTDOCFLAGS=-D warnings`) in the
+  `test` job, catching a broken intra-doc link or missing-docs regression
+  before it would otherwise only surface on docs.rs after a release.
+- `SECURITY.md` (private vulnerability reporting via GitHub's advisory
+  flow) and `.github/dependabot.yml` (weekly `cargo` — both the root crate
+  and `fuzz/`'s separate workspace — and `github-actions` update PRs,
+  grouped by minor/patch) — motivated directly by the `crossbeam-epoch`
+  advisory (RUSTSEC-2026-0204) that broke `cargo-deny` on `main` earlier
+  in this project's history and was only caught because CI happened to run
+  again; Dependabot should open that kind of PR proactively instead.
+
+### Fixed
+
+- `.claude/` (local Claude Code assistant state — scheduled-task locks,
+  not source) was being swept into the published crate package by cargo's
+  default packaging (anything not git-ignored gets included); added to
+  `.gitignore`, confirmed via `cargo package --list` that it no longer
+  appears in the package contents.
 
 ### Changed
 
