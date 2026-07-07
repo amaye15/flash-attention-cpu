@@ -290,14 +290,20 @@ detected") — the pattern expected, since `naive_attention` doesn't use the
   4.9-5x multiplicative speedup at `seq_len=2048` on this 10-core machine,
   independent of and on top of the algorithmic/SIMD/micro-kernel
   differences above.
-- **Real x86_64 CI numbers for this round** hadn't been fetched as this
-  section was written (the local NEON measurements above were the
-  priority to get right first) — see
+- **Real x86_64 CI numbers confirm a genuine improvement, at noisier and
+  more variable magnitude than NEON**: `ubuntu-latest`'s before/after (AVX2,
+  `seq_len=2048`) shows only ~2-5% faster at `d_head=64` but ~14-18% at
+  `d_head=128`; `windows-latest` (also AVX2) shows a more substantial
+  ~11-21% at `d_head=64` and ~29-46% at `d_head=128`. Both are real
+  `Performance has improved`-direction results, not regressions, but the
+  spread between two same-ISA runners (2% vs. 21% at the same shape) is a
+  reminder that shared, contended CI hardware is a much noisier instrument
+  than the dedicated NEON dev machine above — treat the *direction* as
+  reliable and the *magnitude* as illustrative only. The `macos-latest` leg
+  (a second, independent aarch64/NEON data point) showed ~33-35% faster,
+  matching this section's local NEON numbers closely. See
   [the CI logs](https://github.com/amaye15/flash-attention-cpu/actions/workflows/ci.yml)
-  for the actual post-round-3 AVX2/AVX-512 numbers rather than assuming
-  they scale the same way NEON did; round 2 already showed a case (the
-  `dot4x4` register-pressure question) where the x86_64 result didn't
-  match the a priori expectation from the NEON measurement alone.
+  for the full numbers.
 
 **Note on the causal speedup**: it comes from skipping whole `K`/`V` tiles
 (v2/v3 only), so it scales with how many tiles are actually skippable — at
