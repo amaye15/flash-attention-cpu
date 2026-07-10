@@ -373,6 +373,18 @@ elsewhere), not a real effect. A tight, low-drift, back-to-back comparison
 (quick Criterion settings, minimal elapsed time between the two measured
 code states) is what produced the numbers above instead.
 
+Unlike round 3, CI's shared runners were *not* a useful corroboration this
+time: comparing the two most recent `benches/history.csv` CI entries
+(same target/thread-count, so a fair join) shows swings up to ±50% in both
+directions across `linux-x86_64`/`macos-aarch64`/`windows-x86_64`,
+including genuine `SLOWER` readings on `windows-x86_64` for `v2`/`v3` at
+several shapes — far exceeding this round's true effect size and
+occasionally contradicting its direction outright. Round 3's change was
+large enough (~1.3-2x) to surface above that same noise floor; this
+round's is not. Treat the dedicated-machine, drift-controlled numbers
+above as authoritative for this round, and CI's numbers as uninformative
+noise rather than a contradiction.
+
 Peak extra memory at `seq_len=4096`: naive's score matrix is **64.0 MB**;
 v1/v2's tile scratch is **32.0 KB**; v3's is **64.0 KB** (double-buffered
 for the pipeline) — all independent of `seq_len`.
