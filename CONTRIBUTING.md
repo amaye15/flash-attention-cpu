@@ -3,6 +3,17 @@
 Thanks for considering a contribution. This project is small enough that
 there's no formal process — open an issue or PR and it'll get reviewed.
 
+**If a push to `main` doesn't seem to have triggered CI** (no new run shows
+up under Actions after a minute or two, even though the commit landed):
+this has happened at least once and looked like a one-off missed GitHub
+webhook delivery, not a workflow problem — the pushed commit and workflow
+file were both confirmed correct. `gh workflow run ci.yml --ref main` (or
+the "Run workflow" button in the Actions tab, since `workflow_dispatch` is
+enabled) re-triggers it manually without needing a new commit. Note that a
+`workflow_dispatch` run intentionally skips the `bench-history` job (it's
+gated to real `push` events only), so it won't append to
+`benches/history.csv` — only an actual push does that.
+
 ## Building and testing
 
 ```bash
