@@ -203,12 +203,18 @@ fn compute_tile<K: Kernel + Sync>(
     if causal && k_start + this_bc - 1 > q_start {
         for i in 0..this_br {
             let global_i = q_start + i;
+            // Smallest j such that k_start + j > global_i, clamped to
+            // [0, this_bc]. The mask condition is monotonic in j for a
+            // fixed row, so everything from this cutoff onward is masked —
+            // one arithmetic computation + a slice fill instead of a branch
+            // per element.
+            let cutoff = if global_i + 1 >= k_start {
+                (global_i + 1 - k_start).min(this_bc)
+            } else {
+                0
+            };
             let s_row = &mut scores_slice[i * this_bc..(i + 1) * this_bc];
-            for (j, s) in s_row.iter_mut().enumerate() {
-                if k_start + j > global_i {
-                    *s = f32::NEG_INFINITY;
-                }
-            }
+            s_row[cutoff..].fill(f32::NEG_INFINITY);
         }
     }
 }

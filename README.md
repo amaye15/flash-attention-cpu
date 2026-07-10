@@ -334,6 +334,45 @@ short-sequence causal workloads (e.g. small-context autoregressive
 decoding), a smaller `block_size_kv` trades a little non-causal throughput
 for more skip granularity — tune `FlashAttentionConfig` for your workload.
 
+**Round 4 (causal masking)**: the first three rounds all targeted QK^T/PV/
+softmax bookkeeping; auditing what was left untouched turned up the causal
+mask itself — a scalar branch-per-element loop
+(`if k_start + j > global_i { *s = -inf }`) in `v1.rs`/`v2.rs`/`v3.rs`.
+The mask condition is monotonic in `j` for a fixed row, so it's really
+"fill from a computed cutoff column onward" — replaced with one arithmetic
+computation + `[f32]::fill()` per row instead of a branch per element
+(plus a missing tile-skip guard added to `v1.rs`, matching `v2.rs`/`v3.rs`,
+so fully-past KV blocks don't even enter the masking loop). Isolated
+microbenchmark on the masking pass itself (NEON, correctness-checked
+against the branchy reference): **3.9-4.5x** faster
+(`Br=64,Bc=128`: 2235.5ns → 501.1ns; `Br=64,Bc=256`: 3923.0ns → 1048.3ns).
+
+End-to-end, this is a small, Amdahl's-law-limited win since masking only
+runs on the one diagonal-straddling tile per query block (everything else
+is either skipped entirely or needs no masking at all) — so the effect is
+largest at small `seq_len`, where that one tile is a bigger fraction of
+total work, and fades to noise at large `seq_len`. Criterion, default
+threading, paired back-to-back to control for this machine's thermal
+drift (a real confound here — see below): `seq_len=128` causal paths
+**4.1-6.3% faster** (`flash_causal`/`v1_causal`/`v3_causal`: 4.4%/6.3%/
+4.1%), `seq_len=512` **2.7-4.1% faster**, `seq_len=2048` within noise for
+`v1`/`v2` and a noisier ~7% for `v3` (wide confidence interval at this
+quick sample size). A second candidate — hand-written NEON for the final
+per-row output-normalize loop — was checked and ruled out: it measured
+*slower* than the existing scalar Rust (4.42ns/call vs. 2.60ns/call at
+`d_head=64`), since LLVM's autovectorization already beats a hand-rolled
+version for this trivial, dependency-free loop.
+
+**Methodological note**: this round's first end-to-end measurement showed
+an apparent *regression* at `seq_len=2048` (+5-6%), which didn't match the
+algorithmic prediction above. Re-benchmarking the *unmodified* code against
+its own earlier baseline reproduced the same ~7-12% "regression" — proving
+it was thermal/background-load drift accumulated over a long benchmarking
+session (consistent with the variance this README already calls out
+elsewhere), not a real effect. A tight, low-drift, back-to-back comparison
+(quick Criterion settings, minimal elapsed time between the two measured
+code states) is what produced the numbers above instead.
+
 Peak extra memory at `seq_len=4096`: naive's score matrix is **64.0 MB**;
 v1/v2's tile scratch is **32.0 KB**; v3's is **64.0 KB** (double-buffered
 for the pipeline) — all independent of `seq_len`.

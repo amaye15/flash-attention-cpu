@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Causal masking, in `v1.rs`/`v2.rs`/`v3.rs`, replaces a scalar
+  branch-per-element loop (`if k_start + j > global_i { *s = -inf }`) with
+  a computed cutoff column + `[f32]::fill()` — the mask condition is
+  monotonic in `j` for a fixed row, so this is an exact reimplementation,
+  not an approximation. `v1.rs` additionally gained the tile-skip guard
+  `v2.rs`/`v3.rs` already had, so fully-past KV blocks no longer enter the
+  masking loop at all. Isolated microbenchmark on the masking pass itself:
+  3.9-4.5x faster (NEON, correctness-checked against the branchy
+  reference). End-to-end this is Amdahl's-law-limited (masking only ever
+  touches one tile per query block), measured via drift-controlled
+  Criterion pairs at 4.1-6.3% faster at `seq_len=128`, 2.7-4.1% at
+  `seq_len=512`, within noise at `seq_len=2048` — see the README's
+  Benchmarks section for the full numbers and the methodological note on
+  controlling for this machine's thermal drift.
 - Persistent, cross-commit benchmark history: `examples/bench_quick.rs`
   gained a `--csv` mode (tagged with commit/os/arch/thread-count, no new
   dependency — Unix-epoch timestamp instead of pulling in `chrono`/`time`);
