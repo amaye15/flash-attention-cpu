@@ -52,6 +52,55 @@ jobs:
           fi
       - name: cargo run --example bench_quick (real-hardware timing, informational only — shared CI runners are noisy, not for regression gating)
         run: cargo run --release --example bench_quick
+      - name: cargo run --example bench_quick --csv (persistent history — see the bench-history job)
+        shell: bash
+        run: |
+          short_sha="${GITHUB_SHA:0:8}"
+          BENCH_COMMIT="$short_sha" cargo run --release --example bench_quick -- --csv > "bench-${{ matrix.os }}.csv"
+      - name: upload bench CSV artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-csv-${{ matrix.os }}
+          path: bench-${{ matrix.os }}.csv
+
+  bench-history:
+    name: append benchmark history
+    needs: test
+    # Only on a real push to main — not PRs (no write access needed/wanted
+    # there) and not workflow_dispatch reruns of an old ref. `needs: test`
+    # already means this is skipped if any matrix leg failed, which is the
+    # right call: don't record perf data for a broken build.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bench-csv-*
+          path: bench-csv
+          merge-multiple: true
+      - name: append, commit, and push (idempotent — skips if this commit is already recorded, e.g. on a job re-run)
+        shell: bash
+        run: |
+          short_sha="${GITHUB_SHA:0:8}"
+          if grep -q ",$short_sha," benches/history.csv 2>/dev/null; then
+            echo "commit $short_sha already recorded in benches/history.csv, skipping"
+            exit 0
+          fi
+          for f in bench-csv/*.csv; do
+            tail -n +2 "$f" >> benches/history.csv
+          done
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add benches/history.csv
+          git commit -m "chore: append CI benchmark history for ${short_sha} [skip ci]"
+          git fetch origin main
+          git rebase origin/main
+          git push origin main
 
   cross-check-x86_64:
     name: cross-check (x86_64-apple-darwin, from macOS aarch64 host)

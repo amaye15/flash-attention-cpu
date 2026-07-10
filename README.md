@@ -224,6 +224,20 @@ Correctness above for how that's verified). Reproduce with
 kernel will engage instead on x86_64 hardware, with its own numbers.
 `d_head=64` unless noted; times in ms.
 
+The tables below are the honest, hand-curated *narrative* — what changed and
+why, at the time each round landed. For the raw, growing *data* — one row
+per `(commit, os, arch, threads, variant, causal, seq_len, d_head) ->
+time_ms` measurement, comparable across commits — see
+[`benches/history.csv`](benches/history.csv), appended to automatically by
+CI on every push to `main` (one job per `ubuntu-latest`/`macos-latest`/
+`windows-latest` leg feeds a single append-and-commit job, so all three
+targets land together) and appendable locally with
+`cargo run --release --example bench_quick -- --csv >> benches/history.csv`.
+`cargo run --release --example bench_compare` diffs the two most recent
+commits in that file (or `bench_compare <old> <new>` for two specific ones),
+joining on everything except the timing so it never compares across
+different targets or thread counts by accident.
+
 These numbers reflect a third round of optimization: `Kernel::pv4` widened
 from 4 to 8 independent accumulator chains, and the online-softmax
 bookkeeping (`Kernel::max_reduce4`/`sub_exp_sum_inplace4`) row-blocked by 4
@@ -450,8 +464,10 @@ tests/correctness.rs   v1/v2/v3 vs. naive across shapes, causal + multihead,
                        plus a v1/v2/v3 mutual-agreement check (native targets)
 tests/wasm_simd.rs     wasm-bindgen-test suite, run via `wasm-pack test --node`
 benches/bench.rs       Criterion benchmarks (naive, v1, v2/flash, v3) — not wasm32
+benches/history.csv    persistent cross-commit benchmark history (see Benchmarks above)
 examples/basic.rs       usage demo
-examples/bench_quick.rs manual-timing sanity check (no Criterion wait)
+examples/bench_quick.rs manual-timing sanity check (no Criterion wait); `--csv` appends to history.csv
+examples/bench_compare.rs diffs two commits' worth of benches/history.csv
 fuzz/fuzz_targets/flash_attention.rs   cargo-fuzz differential fuzzing, v1/v2/v3 vs. each other
 .cargo/config.toml      enables wasm32 SIMD128 for this repo's own builds/tests
 ```

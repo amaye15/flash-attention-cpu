@@ -76,6 +76,26 @@ implementation choice. `tests/correctness.rs`'s `v1_v2_v3_mutually_agree`
 test (and the `fuzz/` target below) exist specifically to catch the three
 variants drifting apart when they shouldn't.
 
+## Recording a benchmark
+
+CI appends real numbers to `benches/history.csv` (one row per
+`(commit, os, arch, threads, variant, causal, seq_len, d_head) -> time_ms`)
+automatically on every push to `main`, so most of the time you don't need
+to do anything. To add a deliberate local snapshot yourself — e.g. before
+and after a change you're about to make, on hardware CI doesn't cover:
+
+```bash
+cargo run --release --example bench_quick -- --csv >> benches/history.csv
+cargo run --release --example bench_compare               # diffs the last two commits recorded
+cargo run --release --example bench_compare <old> <new>    # or two specific ones (prefix match ok)
+```
+
+`bench_quick --csv` tags each row with the current `git rev-parse --short
+HEAD` unless `BENCH_COMMIT` is set (CI sets it to `$GITHUB_SHA`). Only
+commit `benches/history.csv` alongside a change if the numbers actually
+mean something for that change — don't commit noise from an idle-machine
+sanity check.
+
 ## Fuzzing
 
 ```bash

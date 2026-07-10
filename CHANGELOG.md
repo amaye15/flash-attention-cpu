@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Persistent, cross-commit benchmark history: `examples/bench_quick.rs`
+  gained a `--csv` mode (tagged with commit/os/arch/thread-count, no new
+  dependency — Unix-epoch timestamp instead of pulling in `chrono`/`time`);
+  `benches/history.csv` (git-tracked) accumulates rows over time; a new
+  `examples/bench_compare.rs` diffs two commits' worth of it, joined on
+  everything except the timing so it never compares across different
+  targets/thread-counts by accident. CI appends automatically after every
+  push to `main` (one job per OS leg uploads its CSV as an artifact, a
+  single downstream job concatenates and commits, idempotent against
+  job re-runs via a per-commit dedup check); the same `--csv` flag works
+  identically for a deliberate local snapshot.
 - Project scaffolding: dual MIT/Apache-2.0 license, CI (GitHub Actions:
   native test matrix, x86_64 cross-check, WASM via `wasm-pack test --node`,
   MSRV check, `cargo-deny`), `cargo-fuzz` differential-fuzzing harness,

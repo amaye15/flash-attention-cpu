@@ -3,7 +3,7 @@ use flash_attention_cpu::{
     FlashAttentionConfig,
 };
 use rand::{Rng, SeedableRng};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 fn random_vec(n: usize, seed: u64) -> Vec<f32> {
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
@@ -20,11 +20,39 @@ fn time_it<F: FnMut()>(mut f: F, iters: u32) -> f64 {
     start.elapsed().as_secs_f64() / iters as f64
 }
 
+/// Resolves the commit this run should be tagged as in `--csv` mode: an
+/// explicit `BENCH_COMMIT` env var (CI passes `$GITHUB_SHA`) takes
+/// priority, falling back to a best-effort `git rev-parse` for zero-config
+/// local use, and finally `"unknown"` if neither is available (e.g. running
+/// from a source tarball with no `.git` directory).
+fn resolve_commit() -> String {
+    if let Ok(c) = std::env::var("BENCH_COMMIT") {
+        return c;
+    }
+    std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 fn main() {
-    println!(
-        "{:>7} {:>5} | {:>9} | {:>8} {:>8} {:>8} | {:>8} {:>8} {:>8}",
-        "seq", "d", "naive_ms", "v1_ms", "v2_ms", "v3_ms", "v1c_ms", "v2c_ms", "v3c_ms"
-    );
+    let csv_mode = std::env::args().any(|a| a == "--csv");
+    // (variant, causal, seq_len, d_head, time_ms) — collected regardless of
+    // output mode so the measurement loop below stays a single source of
+    // truth; only the printing at the end differs.
+    let mut rows: Vec<(&'static str, bool, usize, usize, f64)> = Vec::new();
+
+    if !csv_mode {
+        println!(
+            "{:>7} {:>5} | {:>9} | {:>8} {:>8} {:>8} | {:>8} {:>8} {:>8}",
+            "seq", "d", "naive_ms", "v1_ms", "v2_ms", "v3_ms", "v1c_ms", "v2c_ms", "v3c_ms"
+        );
+    }
 
     for &(seq_len, d_head) in &[(256, 64), (512, 64), (1024, 64), (2048, 64), (1024, 128)] {
         let q = random_vec(seq_len * d_head, 1);
@@ -102,18 +130,50 @@ fn main() {
             iters,
         );
 
-        println!(
-            "{:>7} {:>5} | {:>9.3} | {:>8.3} {:>8.3} {:>8.3} | {:>8.3} {:>8.3} {:>8.3}",
-            seq_len,
-            d_head,
-            naive_t * 1000.0,
-            v1_t * 1000.0,
-            v2_t * 1000.0,
-            v3_t * 1000.0,
-            v1c_t * 1000.0,
-            v2c_t * 1000.0,
-            v3c_t * 1000.0,
-        );
+        if csv_mode {
+            rows.push(("naive", false, seq_len, d_head, naive_t * 1000.0));
+            rows.push(("v1", false, seq_len, d_head, v1_t * 1000.0));
+            rows.push(("v2", false, seq_len, d_head, v2_t * 1000.0));
+            rows.push(("v3", false, seq_len, d_head, v3_t * 1000.0));
+            rows.push(("v1", true, seq_len, d_head, v1c_t * 1000.0));
+            rows.push(("v2", true, seq_len, d_head, v2c_t * 1000.0));
+            rows.push(("v3", true, seq_len, d_head, v3c_t * 1000.0));
+        } else {
+            println!(
+                "{:>7} {:>5} | {:>9.3} | {:>8.3} {:>8.3} {:>8.3} | {:>8.3} {:>8.3} {:>8.3}",
+                seq_len,
+                d_head,
+                naive_t * 1000.0,
+                v1_t * 1000.0,
+                v2_t * 1000.0,
+                v3_t * 1000.0,
+                v1c_t * 1000.0,
+                v2c_t * 1000.0,
+                v3c_t * 1000.0,
+            );
+        }
+    }
+
+    if csv_mode {
+        // Deliberately no date/time dependency (chrono/time) for a single
+        // integer column in one example — Unix seconds sorts and diffs
+        // fine, and this crate's only runtime dependency is `rayon`.
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let commit = resolve_commit();
+        let os = std::env::consts::OS;
+        let arch = std::env::consts::ARCH;
+        let threads = rayon::current_num_threads();
+
+        println!("timestamp,commit,os,arch,threads,variant,causal,seq_len,d_head,time_ms");
+        for (variant, causal, seq_len, d_head, time_ms) in rows {
+            println!(
+                "{timestamp},{commit},{os},{arch},{threads},{variant},{causal},{seq_len},{d_head},{time_ms:.4}"
+            );
+        }
+        return;
     }
 
     // Peak extra-memory comparison at a size where it actually matters.
