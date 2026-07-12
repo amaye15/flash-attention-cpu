@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- WASM `relaxed-simd` real FMA: `simd128.rs` gained a single `fma128_ps`
+  helper (`a*b+c`) used at every accumulation site (`dot`, `dot4`,
+  `dot4x4`, `axpy`, `pv4`, `exp128_ps`'s polynomial) that selects the real,
+  single-rounding `f32x4_relaxed_madd` under a further opt-in
+  `target_feature = "relaxed-simd"` (stable since Rust 1.82, standardized
+  as WebAssembly's Phase-4 relaxed-simd proposal since 2024 — this crate's
+  own docs previously, incorrectly, called it not-yet-standard) and falls
+  back to the previous separate multiply-then-add otherwise. Validated
+  with real execution both ways via `wasm-pack test --node`; CI gained a
+  dedicated `wasm-relaxed-simd` job (guarded by a
+  `relaxed_simd_target_feature_is_actually_enabled` test so it can't
+  silently degrade to testing the unfused path). See
+  [ROADMAP.md](ROADMAP.md#1-wasm-relaxed-simd-real-fma-doc-correction--open-opportunity).
+  No throughput number is published for this — this repo has no wasm32
+  timing harness (`Instant` panics without a JS shim there, and
+  Criterion/`bench_quick.rs` are both native-only); the guaranteed benefit
+  is numerical (one rounding instead of two), consistent with this
+  project's practice of only publishing measured numbers, not assumed ones.
+- Fixed a latent, pre-existing gap surfaced while validating the above:
+  `simd128.rs`'s own inline `#[cfg(test)] mod tests` (all ten of them,
+  including the new `fma_matches_mul_add`) were plain `#[test]` functions,
+  which `wasm-bindgen-test`'s harness silently never runs on
+  `wasm32-unknown-unknown` (`wasm-pack test --node` reported "no tests to
+  run!" for that binary) — converted to `#[wasm_bindgen_test]` so they
+  actually execute now.
 - Causal masking, in `v1.rs`/`v2.rs`/`v3.rs`, replaces a scalar
   branch-per-element loop (`if k_start + j > global_i { *s = -inf }`) with
   a computed cutoff column + `[f32]::fill()` — the mask condition is
@@ -100,6 +125,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   advisory (RUSTSEC-2026-0204) that broke `cargo-deny` on `main` earlier
   in this project's history and was only caught because CI happened to run
   again; Dependabot should open that kind of PR proactively instead.
+- `ROADMAP.md`: research-backed prioritization of README's Extension
+  points, checked against current upstream/ecosystem status rather than
+  left as a static wishlist. Corrects a stale claim in both README and
+  `simd128.rs`'s module docs — WASM `relaxed-simd`'s real FMA was described
+  as "not-yet-standard," but the proposal reached Phase 4 in 2024 and Rust
+  stabilized the corresponding intrinsics in 1.82, under this crate's MSRV;
+  it's a real, currently-unused near-term opportunity, not a future one.
+  Also sequences bf16 ahead of int8/VNNI (bf16 needs no calibration
+  infrastructure, int8 does — now backed by real INT8-attention accuracy
+  data rather than a guess), and adds Arm SVE and SME2/KleidiAI as newly
+  identified extension points (both nightly-only or lacking any stable
+  Rust intrinsics path today, so tracked rather than pursued). A same-core
+  algorithmic softmax reformulation (FLASH-D, ISLPED 2025) originally
+  flagged here as the one item needing no new ISA at all was subsequently
+  worked through in full and **not adopted** — see the `ROADMAP.md` update
+  further up this changelog and item 3 there for the derivation showing it
+  trades v2's already-deferred single division for a division per tile,
+  a net regression rather than a win for this crate's tile-blocked design.
 
 ### Fixed
 

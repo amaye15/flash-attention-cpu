@@ -138,6 +138,35 @@ jobs:
       - name: wasm-pack test --node
         run: wasm-pack test --node
 
+  wasm-relaxed-simd:
+    # Separate job, not a matrix leg on `wasm` above, so the two are easy to
+    # tell apart in the Actions UI and so a failure here doesn't read as a
+    # regression in the baseline simd128 path. `RUSTFLAGS` overrides (rather
+    # than merges with) `.cargo/config.toml`'s `target.wasm32-unknown-unknown
+    # .rustflags`, so `+relaxed-simd` alone is enough — it implies `simd128`
+    # as a prerequisite feature. Node/V8 (what `wasm-pack test --node` runs
+    # against) supports relaxed-simd; this doesn't say anything about Safari,
+    # which is still behind a flag — see src/simd128.rs's module docs.
+    name: wasm32 relaxed-simd (real execution via Node.js)
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-C target-feature=+relaxed-simd"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - name: cargo clippy --target wasm32-unknown-unknown (relaxed-simd)
+        run: cargo clippy --target wasm32-unknown-unknown --lib -- -D warnings
+      - name: wasm-pack test --node (relaxed-simd)
+        run: wasm-pack test --node
+
   msrv:
     name: MSRV (1.89.0)
     runs-on: ubuntu-latest

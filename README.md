@@ -127,8 +127,12 @@ used in most SIMD math libraries) rather than a scalar `libm` call per lane
 `f32::exp` across `x ∈ [-80, 80]`: **~1.2e-7** on every kernel (see each
 module's `tests::exp_matches_std`). One numerical wrinkle: AVX2/AVX-512/NEON
 all have a genuine fused multiply-add (`vfmadd*`/`vfmaq_f32`, single
-rounding); WASM SIMD128's baseline instruction set doesn't (`dot`/`axpy`
-there are a separate multiply then add — see `simd128.rs`'s module docs).
+rounding); WASM SIMD128's baseline instruction set doesn't, unless the
+further opt-in `relaxed-simd` target feature is also enabled at compile
+time, in which case `simd128.rs`'s `fma128_ps` helper uses the real,
+stable-since-1.82 `f32x4_relaxed_madd` instead of a separate multiply then
+add — see `simd128.rs`'s module docs and
+[ROADMAP.md](ROADMAP.md#1-wasm-relaxed-simd-real-fma-doc-correction--open-opportunity).
 
 ### WASM
 
@@ -442,7 +446,10 @@ above.
 
 ## Extension points
 
-Deliberately out of scope for this pass, but the architecture leaves room:
+Deliberately out of scope for this pass, but the architecture leaves room.
+See [ROADMAP.md](ROADMAP.md) for the research and prioritization behind
+each of these (external evidence, effort, sequencing, and what's
+gated on upstream toolchain support rather than a decision here):
 
 - ~~**AVX-512**~~ — implemented (`src/avx512.rs`), checked ahead of AVX2 in
   the x86_64 feature-detection chain. Type-checks and passes clippy
@@ -453,13 +460,20 @@ Deliberately out of scope for this pass, but the architecture leaves room:
   above and the Benchmarks section for real numbers.
 - ~~**WASM SIMD128**~~ — implemented (`src/simd128.rs`), opt-in via
   `target_feature = "simd128"` since WASM has no runtime feature detection;
-  see the WASM subsection above. Real relaxed-simd FMA (WASM's proposal
-  adding a fused multiply-add) is a further, not-yet-standard step beyond
-  baseline `simd128` and isn't used here.
+  see the WASM subsection above.
+- ~~**WASM `relaxed-simd` real FMA**~~ — implemented (`fma128_ps` in
+  `src/simd128.rs`), a second, further opt-in
+  (`target_feature = "relaxed-simd"`) layered on top of baseline `simd128`;
+  see [ROADMAP.md](ROADMAP.md#1-wasm-relaxed-simd-real-fma-doc-correction--open-opportunity)
+  for why it's a separate flag (Safari doesn't support it yet, unlike
+  baseline `simd128`) rather than folded into `.cargo/config.toml`'s default.
 - **AVX-512 sub-extensions** (`avx512dq`/`avx512bw`/`avx512vl`/`avx512vnni`,
   etc.): `avx512.rs` only uses the baseline `avx512f`. VNNI in particular
   targets int8 dot-product acceleration, which would only matter alongside
-  the lower-precision work below.
+  the lower-precision work below — external accuracy data on token-level
+  INT8 attention quantization now exists (see
+  [ROADMAP.md](ROADMAP.md#4-int8-quantized-qktpv-vnni-path)), but this
+  should still follow bf16, not precede it.
 - ~~**Register-blocked micro-kernel**~~ — implemented in two rounds:
   one-sided blocking (`Kernel::dot4`/former `axpy4`), then a packed
   two-sided QK^T micro-kernel (`Kernel::dot4x4`) and a register-resident
@@ -479,7 +493,10 @@ Deliberately out of scope for this pass, but the architecture leaves room:
   processing + FP8). Considered and explicitly deferred for `v3` here —
   it's a separate, substantial piece of work (quantization/calibration, a
   new low-precision kernel, accuracy validation) independent of the
-  scheduling change `v3` focuses on.
+  scheduling change `v3` focuses on. If picked up, `bf16` (AVX512_BF16
+  `vdpbf16ps` / Arm `bfdot`, f32-accumulated — same shape as the existing
+  `Kernel::dot` contract) is the sequenced first step, ahead of int8; see
+  [ROADMAP.md](ROADMAP.md#2-bf16-dot-product-acceleration-avx512_bf16-vdpbf16ps-arm-bfdot).
 - **Thread-level producer/consumer pipelining**: a more literal CPU analog
   of GPU warp specialization (one thread computing score tiles into a
   bounded queue, another consuming them for softmax+PV) was considered for
@@ -492,6 +509,23 @@ Deliberately out of scope for this pass, but the architecture leaves room:
   onto this crate's fixed-width `Kernel` trait as directly as SSE/NEON/wasm
   did — a real design question, not just a new file, so left until Rust's
   intrinsics stabilize.
+- **Arm SVE** (server Arm — Graviton3/4, Neoverse V-series): same posture
+  as RVV, for the same reason — intrinsics are nightly-only, blocked
+  upstream on a Rust language prerequisite with no committed stabilization
+  date. See [ROADMAP.md](ROADMAP.md#5-arm-sve-new-item--not-previously-in-readme).
+- **Arm SME2/KleidiAI and Intel AMX**: real, large reported speedups, but
+  both are matrix-tile coprocessor ISAs (special calling conventions/tile
+  registers) rather than "a wider vector register," with no stable Rust
+  intrinsics path — a different category of engineering than this crate's
+  `Kernel`-trait SIMD tiers. Tracked, not pursued; see
+  [ROADMAP.md](ROADMAP.md#6-arm-sme2--kleidiai-style-matrix-acceleration-new-item).
+- **Algorithmic softmax reformulation** (FLASH-D-style hidden-division/
+  no-max-subtraction rewrite) — investigated, not adopted: it trades v2's
+  already-deferred single end-of-row division for a division *every tile*
+  to maintain the always-normalized running output the max-elimination
+  depends on, a net regression here rather than a win. See
+  [ROADMAP.md](ROADMAP.md#3-flash-d-style-hidden-softmax-division-reformulation)
+  for the derivation.
 - **Backward pass**: this is forward/inference only. Training needs the
   recomputation-based backward pass from the flash attention paper.
 

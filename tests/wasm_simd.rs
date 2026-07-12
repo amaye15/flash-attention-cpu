@@ -114,3 +114,14 @@ fn simd128_target_feature_is_actually_enabled() {
         "simd128 not enabled — the tests above ran the scalar fallback, not Simd128Kernel"
     );
 }
+
+/// Only exists when built with `relaxed-simd` (CI's `wasm-relaxed-simd` job,
+/// via `RUSTFLAGS="-C target-feature=+relaxed-simd"`) — guards against that
+/// job silently degrading to the default `simd128`-only build and testing
+/// nothing new, the same way `simd128_target_feature_is_actually_enabled`
+/// guards the base case above.
+#[cfg(target_feature = "relaxed-simd")]
+#[wasm_bindgen_test]
+fn relaxed_simd_target_feature_is_actually_enabled() {
+    assert!(cfg!(target_feature = "relaxed-simd"));
+}

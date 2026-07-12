@@ -9,12 +9,22 @@
 //! it, this module doesn't exist and every variant falls back to
 //! [`crate::scalar`].
 //!
-//! **No native fused-multiply-add.** WASM SIMD128's baseline instruction
-//! set (unlike AVX2/AVX-512's `vfmadd*`/NEON's `vfmaq_f32`) has no fused
-//! multiply-add — `dot`/`axpy` here are a separate multiply then add, two
-//! roundings instead of one. (WASM's "relaxed-simd" proposal adds a
-//! relaxed FMA, but it isn't part of stable `simd128` and isn't assumed
-//! available here.)
+//! **Fused multiply-add, opt-in.** WASM SIMD128's baseline instruction set
+//! (unlike AVX2/AVX-512's `vfmadd*`/NEON's `vfmaq_f32`) has no fused
+//! multiply-add of its own — every accumulation here is structured as a
+//! separate multiply then add, two roundings instead of one, *unless* the
+//! further opt-in `relaxed-simd` target feature is also enabled at compile
+//! time (WASM has no runtime feature detection, so this is a build-time
+//! choice — see [`fma128_ps`]). `relaxed-simd` reached full
+//! standardization (Phase 4) in 2024 and Rust stabilized the corresponding
+//! `core::arch::wasm32` intrinsics in 1.82, comfortably under this crate's
+//! MSRV — but it's a narrower guarantee than baseline `simd128`: Chrome and
+//! Firefox (and Node.js/V8, which is what `wasm-pack test --node` runs
+//! against) support it, Safari doesn't yet. That's why it's a second,
+//! separate opt-in layered on top of `simd128` rather than folded into the
+//! default `.cargo/config.toml` flags this repo's own tests build with —
+//! see [ROADMAP.md](https://github.com/amaye15/flash-attention-cpu/blob/main/ROADMAP.md#1-wasm-relaxed-simd-real-fma-doc-correction--open-opportunity)
+//! and CI's `wasm-relaxed-simd` job for how the fused path gets exercised.
 //!
 //! `exp128_ps` is the same algorithm as `avx2::exp256_ps`/
 //! `neon::exp128_ps` (range-reduce, degree-5 minimax polynomial, direct
@@ -101,6 +111,31 @@ unsafe fn hmax128_ps(v: v128) -> f32 {
         .max(f32x4_extract_lane::<3>(v))
 }
 
+/// `a * b + c`, fused when the `relaxed-simd` target feature is enabled at
+/// compile time (`f32x4_relaxed_madd` — one rounding), falling back to a
+/// separate multiply then add (two roundings) when it isn't — see module
+/// docs. Every accumulation site in this file goes through this one
+/// function so the fused/unfused choice is made in exactly one place.
+///
+/// "Relaxed" here refers to the *specification* allowing either
+/// fused-or-not codegen depending on the target (that's the portability
+/// tradeoff, not a precision one on any single run) — on hardware that
+/// actually executes it fused (`f32x4.relaxed_madd` compiles to real FMA
+/// on both x86 and Arm backends), results are at least as accurate as the
+/// unfused path, never less.
+#[inline]
+#[target_feature(enable = "simd128")]
+unsafe fn fma128_ps(a: v128, b: v128, c: v128) -> v128 {
+    #[cfg(target_feature = "relaxed-simd")]
+    {
+        f32x4_relaxed_madd(a, b, c)
+    }
+    #[cfg(not(target_feature = "relaxed-simd"))]
+    {
+        f32x4_add(c, f32x4_mul(a, b))
+    }
+}
+
 /// Dot product, 2-way accumulator unrolled (8 f32 / iteration) — same idea
 /// as `avx2::dot_avx2`/`neon::dot_neon`, just without a fused multiply-add
 /// (see module docs), so each step is a separate `mul` + `add`.
@@ -114,16 +149,16 @@ unsafe fn dot_simd128(a: &[f32], b: &[f32]) -> f32 {
     while i + 8 <= len {
         let a0 = v128_load(a.as_ptr().add(i) as *const v128);
         let b0 = v128_load(b.as_ptr().add(i) as *const v128);
-        acc0 = f32x4_add(acc0, f32x4_mul(a0, b0));
+        acc0 = fma128_ps(a0, b0, acc0);
         let a1 = v128_load(a.as_ptr().add(i + 4) as *const v128);
         let b1 = v128_load(b.as_ptr().add(i + 4) as *const v128);
-        acc1 = f32x4_add(acc1, f32x4_mul(a1, b1));
+        acc1 = fma128_ps(a1, b1, acc1);
         i += 8;
     }
     while i + 4 <= len {
         let av = v128_load(a.as_ptr().add(i) as *const v128);
         let bv = v128_load(b.as_ptr().add(i) as *const v128);
-        acc0 = f32x4_add(acc0, f32x4_mul(av, bv));
+        acc0 = fma128_ps(av, bv, acc0);
         i += 4;
     }
     let mut sum = hsum128_ps(f32x4_add(acc0, acc1));
@@ -151,22 +186,10 @@ unsafe fn dot4_simd128(a0: &[f32], a1: &[f32], a2: &[f32], a3: &[f32], b: &[f32]
     let mut i = 0usize;
     while i + 4 <= len {
         let bv = v128_load(b.as_ptr().add(i) as *const v128); // loaded once, shared 4 ways
-        acc0 = f32x4_add(
-            acc0,
-            f32x4_mul(v128_load(a0.as_ptr().add(i) as *const v128), bv),
-        );
-        acc1 = f32x4_add(
-            acc1,
-            f32x4_mul(v128_load(a1.as_ptr().add(i) as *const v128), bv),
-        );
-        acc2 = f32x4_add(
-            acc2,
-            f32x4_mul(v128_load(a2.as_ptr().add(i) as *const v128), bv),
-        );
-        acc3 = f32x4_add(
-            acc3,
-            f32x4_mul(v128_load(a3.as_ptr().add(i) as *const v128), bv),
-        );
+        acc0 = fma128_ps(v128_load(a0.as_ptr().add(i) as *const v128), bv, acc0);
+        acc1 = fma128_ps(v128_load(a1.as_ptr().add(i) as *const v128), bv, acc1);
+        acc2 = fma128_ps(v128_load(a2.as_ptr().add(i) as *const v128), bv, acc2);
+        acc3 = fma128_ps(v128_load(a3.as_ptr().add(i) as *const v128), bv, acc3);
         i += 4;
     }
     let mut sums = [
@@ -203,7 +226,7 @@ unsafe fn dot4x4_simd128(q: [&[f32]; 4], k: [&[f32]; 4]) -> [[f32; 4]; 4] {
         for c in 0..4 {
             let kv = v128_load(k[c].as_ptr().add(p) as *const v128); // loaded once, shared 4 ways
             for r in 0..4 {
-                acc[r][c] = f32x4_add(acc[r][c], f32x4_mul(qv[r], kv));
+                acc[r][c] = fma128_ps(qv[r], kv, acc[r][c]);
             }
         }
         p += 4;
@@ -252,7 +275,7 @@ unsafe fn exp128_ps(x: v128) -> v128 {
     let x = f32x4_max(x, exp_lo);
 
     // n = floor(x / ln(2) + 0.5)
-    let fx = f32x4_add(f32x4_mul(x, log2ef), half);
+    let fx = fma128_ps(x, log2ef, half);
     let fx = f32x4_floor(fx);
 
     // r = x - n*ln(2), split hi/lo for precision
@@ -265,12 +288,12 @@ unsafe fn exp128_ps(x: v128) -> v128 {
 
     // degree-5 minimax polynomial for exp(r)
     let mut y = p0;
-    y = f32x4_add(f32x4_mul(y, x), p1);
-    y = f32x4_add(f32x4_mul(y, x), p2);
-    y = f32x4_add(f32x4_mul(y, x), p3);
-    y = f32x4_add(f32x4_mul(y, x), p4);
-    y = f32x4_add(f32x4_mul(y, x), p5);
-    y = f32x4_add(f32x4_mul(y, z), x);
+    y = fma128_ps(y, x, p1);
+    y = fma128_ps(y, x, p2);
+    y = fma128_ps(y, x, p3);
+    y = fma128_ps(y, x, p4);
+    y = fma128_ps(y, x, p5);
+    y = fma128_ps(y, z, x);
     y = f32x4_add(y, one);
 
     // 2^n via direct exponent-bit construction. No bitcast needed: `v128`
@@ -377,7 +400,7 @@ unsafe fn axpy_simd128(dst: &mut [f32], src: &[f32], scale: f32) {
     while i + 4 <= len {
         let d = v128_load(dst.as_ptr().add(i) as *const v128);
         let s = v128_load(src.as_ptr().add(i) as *const v128);
-        let r = f32x4_add(d, f32x4_mul(s, vscale));
+        let r = fma128_ps(s, vscale, d);
         v128_store(dst.as_mut_ptr().add(i) as *mut v128, r);
         i += 4;
     }
@@ -430,14 +453,14 @@ unsafe fn pv4_simd128(acc: [&mut [f32]; 4], v_block: &[f32], p: [&[f32]; 4]) {
             let s1 = f32x4_splat(p[1][j]);
             let s2 = f32x4_splat(p[2][j]);
             let s3 = f32x4_splat(p[3][j]);
-            acc0a = f32x4_add(acc0a, f32x4_mul(vva, s0));
-            acc0b = f32x4_add(acc0b, f32x4_mul(vvb, s0));
-            acc1a = f32x4_add(acc1a, f32x4_mul(vva, s1));
-            acc1b = f32x4_add(acc1b, f32x4_mul(vvb, s1));
-            acc2a = f32x4_add(acc2a, f32x4_mul(vva, s2));
-            acc2b = f32x4_add(acc2b, f32x4_mul(vvb, s2));
-            acc3a = f32x4_add(acc3a, f32x4_mul(vva, s3));
-            acc3b = f32x4_add(acc3b, f32x4_mul(vvb, s3));
+            acc0a = fma128_ps(vva, s0, acc0a);
+            acc0b = fma128_ps(vvb, s0, acc0b);
+            acc1a = fma128_ps(vva, s1, acc1a);
+            acc1b = fma128_ps(vvb, s1, acc1b);
+            acc2a = fma128_ps(vva, s2, acc2a);
+            acc2b = fma128_ps(vvb, s2, acc2b);
+            acc3a = fma128_ps(vva, s3, acc3a);
+            acc3b = fma128_ps(vvb, s3, acc3b);
             j += 1;
         }
         v128_store(a0.as_mut_ptr().add(chunk) as *mut v128, acc0a);
@@ -458,10 +481,10 @@ unsafe fn pv4_simd128(acc: [&mut [f32]; 4], v_block: &[f32], p: [&[f32]; 4]) {
         let mut j = 0usize;
         while j < bc {
             let vv = v128_load(v_block.as_ptr().add(j * d + chunk) as *const v128);
-            acc0 = f32x4_add(acc0, f32x4_mul(vv, f32x4_splat(p[0][j])));
-            acc1 = f32x4_add(acc1, f32x4_mul(vv, f32x4_splat(p[1][j])));
-            acc2 = f32x4_add(acc2, f32x4_mul(vv, f32x4_splat(p[2][j])));
-            acc3 = f32x4_add(acc3, f32x4_mul(vv, f32x4_splat(p[3][j])));
+            acc0 = fma128_ps(vv, f32x4_splat(p[0][j]), acc0);
+            acc1 = fma128_ps(vv, f32x4_splat(p[1][j]), acc1);
+            acc2 = fma128_ps(vv, f32x4_splat(p[2][j]), acc2);
+            acc3 = fma128_ps(vv, f32x4_splat(p[3][j]), acc3);
             j += 1;
         }
         v128_store(a0.as_mut_ptr().add(chunk) as *mut v128, acc0);
@@ -556,11 +579,45 @@ unsafe fn max_reduce4_simd128(x: [&[f32]; 4]) -> [f32; 4] {
     m
 }
 
+// `wasm-bindgen-test`'s harness only discovers `#[wasm_bindgen_test]`-marked
+// functions on wasm32 — plain `#[test]` silently never runs under
+// `wasm-pack test --node` (no OS process/argv support for the default
+// libtest harness on `wasm32-unknown-unknown`; see `tests/wasm_simd.rs`'s
+// module docs for the same point about integration tests). Every test in
+// this module uses `#[wasm_bindgen_test]` instead for exactly that reason —
+// these used to be plain `#[test]` and were silently never executed.
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
 
-    #[test]
+    /// `fma128_ps` must equal `a*b+c` regardless of which branch (fused or
+    /// unfused) it compiles to — this is what makes swapping in the
+    /// `relaxed-simd` path a pure codegen choice rather than a behavior
+    /// change. Tolerance is loose enough to accept either rounding.
+    #[wasm_bindgen_test]
+    fn fma_matches_mul_add() {
+        let cases: [(f32, f32, f32); 5] = [
+            (1.5, 2.5, 0.5),
+            (-3.25, 4.0, 1.0),
+            (0.0, 123.456, -7.0),
+            (1e-6, 1e6, 2.0),
+            (-1.0, -1.0, -1.0),
+        ];
+        for (a, b, c) in cases {
+            let want = a * b + c;
+            let got = unsafe {
+                let r = fma128_ps(f32x4_splat(a), f32x4_splat(b), f32x4_splat(c));
+                f32x4_extract_lane::<0>(r)
+            };
+            assert!(
+                (want - got).abs() < 1e-3 * (want.abs() + 1.0),
+                "a={a} b={b} c={c} want={want} got={got}"
+            );
+        }
+    }
+
+    #[wasm_bindgen_test]
     fn exp_matches_std() {
         let xs: Vec<f32> = (-800..800).map(|i| i as f32 * 0.1).collect();
         let mut got = xs.clone();
@@ -585,7 +642,7 @@ mod tests {
         eprintln!("max relative error vs f32::exp: {max_rel_err:e}");
     }
 
-    #[test]
+    #[wasm_bindgen_test]
     fn dot_matches_scalar() {
         for len in [0usize, 1, 3, 7, 8, 9, 15, 16, 17, 63, 64, 65, 127] {
             let a: Vec<f32> = (0..len).map(|i| (i as f32 * 0.37).sin()).collect();
@@ -599,7 +656,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[wasm_bindgen_test]
     fn dot4_matches_four_dots() {
         for len in [0usize, 1, 3, 4, 5, 7, 8, 9, 33] {
             let mk =
@@ -628,7 +685,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[wasm_bindgen_test]
     fn dot4x4_matches_naive() {
         for d in [0usize, 1, 3, 4, 5, 7, 8, 9, 33] {
             let mk = |seed: f32| -> Vec<f32> { (0..d).map(|i| (i as f32 * seed).sin()).collect() };
@@ -654,7 +711,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[wasm_bindgen_test]
     fn pv4_matches_naive() {
         for (bc, d) in [
             (0usize, 4usize),
@@ -698,7 +755,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[wasm_bindgen_test]
     fn reductions_match_scalar() {
         for len in [0usize, 1, 5, 8, 13, 16, 33] {
             let x: Vec<f32> = (0..len).map(|i| ((i as f32) * 1.3).sin() * 5.0).collect();
@@ -708,7 +765,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[wasm_bindgen_test]
     fn max_reduce4_matches_four_max_reduces() {
         for len in [0usize, 1, 3, 4, 5, 7, 8, 9, 33] {
             let mk =
@@ -725,7 +782,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[wasm_bindgen_test]
     fn sub_exp_sum_inplace4_matches_four_calls() {
         for len in [0usize, 1, 3, 4, 5, 7, 8, 9, 33] {
             let mk = |seed: f32| -> Vec<f32> {
@@ -761,7 +818,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[wasm_bindgen_test]
     fn axpy_and_scale_match_scalar() {
         for len in [0usize, 1, 7, 8, 9, 31, 32, 33] {
             let mut dst: Vec<f32> = (0..len).map(|i| i as f32 * 0.5).collect();
