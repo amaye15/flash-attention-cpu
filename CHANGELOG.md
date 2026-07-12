@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ROADMAP.md` item 2 (bf16 dot-product acceleration) re-verified against
+  stable Rust directly rather than left on the strength of the earlier
+  research pass: AVX512_BF16 (`__m256bh`/`__m512bh`, `_mm256_dpbf16_ps`,
+  `_mm512_dpbf16_ps`, `_mm256_cvtneps_pbh`) compiles cleanly on stable
+  rustc 1.93 (unverified by real hardware in this sandbox, same caveat the
+  AVX-512F path already carries) — but Arm's `bfdot` equivalent
+  (`bfloat16x8_t`, `vbfdotq_f32`, `vcvtq_low_bf16_f32`) does **not** exist
+  on stable Rust, confirmed by compiling directly and natively on this
+  sandbox's own aarch64 host (not cross-compiled) and getting
+  "cannot find type/function in this scope." The item's original framing
+  assumed both were straightforwardly available; corrected, with scoping
+  options for a future round now split out (x86_64-only `vdpbf16ps` path
+  vs. a portable widen-in-kernel path that doesn't need either dot-product
+  ISA extension vs. both, sequenced). No code changed this round — this
+  is a documentation-only correction, implementation deferred pending a
+  scoping decision.
 - WASM `relaxed-simd` real FMA: `simd128.rs` gained a single `fma128_ps`
   helper (`a*b+c`) used at every accumulation site (`dot`, `dot4`,
   `dot4x4`, `axpy`, `pv4`, `exp128_ps`'s polynomial) that selects the real,

@@ -66,27 +66,69 @@ didn't seem proportionate to build for one fused-multiply-add change.
 
 ### 2. bf16 dot-product acceleration (AVX512_BF16 `vdpbf16ps`, Arm `bfdot`)
 
-Promoted out of README's vague "lower precision" bucket to a concrete,
-sequenced first step — ahead of int8, because it needs no calibration or
-accuracy-validation infrastructure. `vdpbf16ps` (AVX512_BF16) takes two
-bf16 vectors and accumulates into an **f32** register — i.e. the same
-shape as this crate's existing `Kernel::dot` contract (lower-precision
-inputs, f32 accumulation), so it composes with the existing tiling/
-online-softmax code without touching softmax numerics at all. Arm's
-equivalent (`bfdot`) is available on ARMv8.6+ and Apple Silicon.
+**Status: partially re-verified, not implemented.** Actually tried
+compiling both hardware paths against stable Rust before committing to an
+implementation plan (same discipline as everywhere else in this list —
+check the toolchain claim directly rather than trust it secondhand), and
+found a real asymmetry this item didn't originally account for:
 
-External signal this is the validated next step, not speculative:
-oneDNN's reference scaled-dot-product-attention primitive already treats
-f32/bf16/f16 as first-tier supported dtypes (int8 is a separate, later
-tier — see item 4 below), and a dedicated `vllm-cpu-avx512bf16` package
-shipped April 2026 pairing AVX512-BF16+VNNI specifically with
-FlashAttention/FlashInfer integration. bf16 halves memory bandwidth, which
-FlashAttention-3's own numerics story identifies as the actual bottleneck
-at long sequence lengths — same motivation, CPU-side.
+- **AVX512_BF16 (x86_64): confirmed available on stable Rust.**
+  `core::arch::x86_64`'s `__m256bh`/`__m512bh` types and
+  `_mm256_dpbf16_ps`/`_mm512_dpbf16_ps`/`_mm256_cvtneps_pbh` all compile
+  cleanly under `#[target_feature(enable = "avx512bf16,avx512f,...")]` on
+  rustc 1.93. Same caveat this crate already documents for AVX-512F
+  itself, though: compiles, but unverified by real execution in this
+  sandbox (no working Rosetta 2 / no AVX512_BF16-capable x86_64 hardware
+  here) — same "type-checks and passes clippy, hardware validation still
+  pending" status the existing AVX-512F path carries.
+- **Arm `bfdot` (NEON): not available on stable Rust.** Tried the direct
+  equivalent — `bfloat16x8_t`, `vbfdotq_f32`, `vcvtq_low_bf16_f32` — on
+  this sandbox's own aarch64 (Apple Silicon) host, natively, not
+  cross-compiled. All three fail to resolve on stable rustc 1.93
+  (`cannot find type/function in this scope`); stdarch's NEON bf16
+  intrinsics are still gated behind an unstable feature. So the original
+  framing above ("Arm's equivalent is available on ARMv8.6+ and Apple
+  Silicon") was wrong about *Rust's* support specifically — the
+  *hardware* extension exists on that silicon, but nothing in stable
+  `core::arch::aarch64` exposes it yet.
 
-**Effort:** real, not a drop-in — needs a decision on Q/K/V storage
-(convert-on-load vs. require bf16 input upstream), a new kernel per arch,
-and accuracy validation vs. the existing `naive.rs` f32 reference.
+This matters because it changes what "bf16 support" can mean right now:
+a real `vdpbf16ps`-style two-sided bf16×bf16→f32 dot product is only
+buildable (and only real-execution-testable in this project's own CI,
+which has no x86_64 AVX512_BF16 runner) on x86_64, with no equivalent
+native-instruction path on Arm today. A *portable* bf16 story (storage as
+bf16, widened to f32 with a plain bit-shift — no dot-product instruction
+needed at all, since `bf16` is exactly the truncated top 16 bits of `f32`
+— then fed through the existing per-arch f32 kernels) is possible on every
+target including Arm, but only captures the caller-side storage-footprint
+win, not the full during-tile-sweep re-read bandwidth reduction that
+motivated this item, unless the widen happens inside each kernel's inner
+loop (i.e., still means writing a new kernel, just one that doesn't need a
+dedicated bf16 ISA extension to do it).
+
+**Recommendation:** revisit as a scoped decision, not a default "yes" —
+options are (a) x86_64-only `vdpbf16ps` path, real hardware validation
+blocked until this project has AVX512_BF16-capable CI/test hardware,
+(b) a portable widen-in-kernel path (scalar + NEON accelerated, both
+real-execution-testable in this sandbox today) that doesn't depend on
+either dot-product ISA extension, or (c) both, sequenced with (b) first
+since it's testable now and (a) can follow once hardware access exists.
+Int8/VNNI (item 4) should still come after whichever of these is chosen,
+per the original sequencing rationale below.
+
+External signal this is still worth pursuing eventually, just not
+speculative busywork: oneDNN's reference scaled-dot-product-attention
+primitive already treats f32/bf16/f16 as first-tier supported dtypes
+(int8 is a separate, later tier — see item 4 below), and a dedicated
+`vllm-cpu-avx512bf16` package shipped April 2026 pairing AVX512-BF16+VNNI
+specifically with FlashAttention/FlashInfer integration. bf16 halves
+memory bandwidth, which FlashAttention-3's own numerics story identifies
+as the actual bottleneck at long sequence lengths — same motivation,
+CPU-side.
+
+**Effort:** real, not a drop-in — needs the storage/kernel-scope decision
+above, a new kernel per arch actually pursued, and accuracy validation vs.
+the existing `naive.rs` f32 reference.
 
 - [AVX-512 BF16 instructions (VDPBF16PS)](https://en.wikichip.org/wiki/x86/avx512_bf16)
 - [oneDNN Scaled Dot-Product Attention (SDPA) — dtype support](https://www.intel.com/content/www/us/en/docs/onednn/developer-guide-reference/2025-2/scaled-dot-product-attention-sdpa.html)

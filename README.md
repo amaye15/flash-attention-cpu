@@ -493,10 +493,15 @@ gated on upstream toolchain support rather than a decision here):
   processing + FP8). Considered and explicitly deferred for `v3` here —
   it's a separate, substantial piece of work (quantization/calibration, a
   new low-precision kernel, accuracy validation) independent of the
-  scheduling change `v3` focuses on. If picked up, `bf16` (AVX512_BF16
-  `vdpbf16ps` / Arm `bfdot`, f32-accumulated — same shape as the existing
-  `Kernel::dot` contract) is the sequenced first step, ahead of int8; see
-  [ROADMAP.md](ROADMAP.md#2-bf16-dot-product-acceleration-avx512_bf16-vdpbf16ps-arm-bfdot).
+  scheduling change `v3` focuses on. If picked up, `bf16` (f32-accumulated
+  — same shape as the existing `Kernel::dot` contract) would be the
+  sequenced first step, ahead of int8 — but confirmed *not* symmetric
+  across architectures: AVX512_BF16 (`vdpbf16ps`) compiles on stable Rust
+  today (unverified by real hardware in this sandbox), while Arm's `bfdot`
+  has no stable-Rust intrinsics yet (checked directly, natively, on this
+  sandbox's own aarch64 host) — see
+  [ROADMAP.md](ROADMAP.md#2-bf16-dot-product-acceleration-avx512_bf16-vdpbf16ps-arm-bfdot)
+  for what that means for scoping this if it's picked up.
 - **Thread-level producer/consumer pipelining**: a more literal CPU analog
   of GPU warp specialization (one thread computing score tiles into a
   bounded queue, another consuming them for softmax+PV) was considered for
