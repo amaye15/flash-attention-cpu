@@ -220,6 +220,22 @@ real x86_64 hardware. WASM SIMD128 *is* executed for real: `wasm-pack test
 `tests/wasm_simd.rs` under Node.js — 5 passing tests, including a guard
 that asserts the feature is actually on (see the SIMD/WASM section above).
 
+The tests above check *numeric* correctness (does the output match the
+oracle) — a separate question from *memory* safety, since every SIMD
+kernel is built on `unsafe` `std::arch` intrinsics. See
+[UNSAFE.md](UNSAFE.md) for a from-scratch audit and the "CPU feature
+token" pattern applied to shrink it: `Kernel`'s methods are safe `&self`
+fns, gated by `Avx2Kernel`/`Avx512Kernel`/`Sse41Kernel::new() -> Option<Self>`
+doing the `is_x86_feature_detected!` check exactly once (possessing the
+value *is* the proof) — down from 133 `unsafe fn` to 62, with `scalar.rs`
+and `v1.rs`/`v2.rs`/`v3.rs`'s orchestration layer now fully safe Rust.
+Every `unsafe {}` block that remains (the genuinely irreducible core —
+calling a raw intrinsic can't not be `unsafe`) carries a `// SAFETY:`
+comment, enforced by `clippy::undocumented_unsafe_blocks`. UNSAFE.md also
+covers a direct (not assumed) check of which kernels currently pass under
+Miri, and real benchmark data on why adopting the `pulp` crate for the
+rest isn't a clean win yet.
+
 ## Benchmarks
 
 Measured in this sandbox: **Apple M4, 10 cores, aarch64** — the NEON kernel

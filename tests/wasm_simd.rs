@@ -108,6 +108,12 @@ fn ragged_sizes() {
 /// pass against the scalar fallback instead of exercising `Simd128Kernel`,
 /// defeating the point of this file.
 #[wasm_bindgen_test]
+// `cfg!(...)` is constant-foldable, so clippy reads this as "asserting a
+// constant" — but that's the point: this is a deliberate, wasm-bindgen-test
+// *runtime*-reported guard (not a `const { assert!(..) }` compile-time one),
+// so a regression shows up as a named test failure in `wasm-pack test`'s
+// output instead of a build error.
+#[allow(clippy::assertions_on_constants)]
 fn simd128_target_feature_is_actually_enabled() {
     assert!(
         cfg!(target_feature = "simd128"),

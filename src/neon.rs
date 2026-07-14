@@ -22,55 +22,74 @@ use std::arch::aarch64::*;
 
 pub(crate) struct NeonKernel;
 
+impl NeonKernel {
+    /// Always succeeds — NEON is part of the mandatory AArch64 baseline
+    /// (see module docs), so there's no runtime precondition to check,
+    /// unlike the x86_64 kernels.
+    pub(crate) fn new() -> Self {
+        Self
+    }
+}
+
 impl Kernel for NeonKernel {
     #[inline]
-    unsafe fn dot(a: &[f32], b: &[f32]) -> f32 {
-        dot_neon(a, b)
+    fn dot(&self, a: &[f32], b: &[f32]) -> f32 {
+        // SAFETY: `Self` is only constructible via `NeonKernel::new()` (see its docs), which already confirmed the precondition below.
+        unsafe { dot_neon(a, b) }
     }
 
     #[inline]
-    unsafe fn dot4(a0: &[f32], a1: &[f32], a2: &[f32], a3: &[f32], b: &[f32]) -> [f32; 4] {
-        dot4_neon(a0, a1, a2, a3, b)
+    fn dot4(&self, a0: &[f32], a1: &[f32], a2: &[f32], a3: &[f32], b: &[f32]) -> [f32; 4] {
+        // SAFETY: `Self` is only constructible via `NeonKernel::new()` (see its docs), which already confirmed the precondition below.
+        unsafe { dot4_neon(a0, a1, a2, a3, b) }
     }
 
     #[inline]
-    unsafe fn dot4x4(q: [&[f32]; 4], k: [&[f32]; 4]) -> [[f32; 4]; 4] {
-        dot4x4_neon(q, k)
+    fn dot4x4(&self, q: [&[f32]; 4], k: [&[f32]; 4]) -> [[f32; 4]; 4] {
+        // SAFETY: `Self` is only constructible via `NeonKernel::new()` (see its docs), which already confirmed the precondition below.
+        unsafe { dot4x4_neon(q, k) }
     }
 
     #[inline]
-    unsafe fn sub_exp_sum_inplace(x: &mut [f32], m: f32) -> f32 {
-        sub_exp_sum_inplace_neon(x, m)
+    fn sub_exp_sum_inplace(&self, x: &mut [f32], m: f32) -> f32 {
+        // SAFETY: `Self` is only constructible via `NeonKernel::new()` (see its docs), which already confirmed the precondition below.
+        unsafe { sub_exp_sum_inplace_neon(x, m) }
     }
 
     #[inline]
-    unsafe fn sub_exp_sum_inplace4(x: [&mut [f32]; 4], m: [f32; 4]) -> [f32; 4] {
-        sub_exp_sum_inplace4_neon(x, m)
+    fn sub_exp_sum_inplace4(&self, x: [&mut [f32]; 4], m: [f32; 4]) -> [f32; 4] {
+        // SAFETY: `Self` is only constructible via `NeonKernel::new()` (see its docs), which already confirmed the precondition below.
+        unsafe { sub_exp_sum_inplace4_neon(x, m) }
     }
 
     #[inline]
-    unsafe fn axpy(dst: &mut [f32], src: &[f32], scale: f32) {
-        axpy_neon(dst, src, scale)
+    fn axpy(&self, dst: &mut [f32], src: &[f32], scale: f32) {
+        // SAFETY: `Self` is only constructible via `NeonKernel::new()` (see its docs), which already confirmed the precondition below.
+        unsafe { axpy_neon(dst, src, scale) }
     }
 
     #[inline]
-    unsafe fn pv4(acc: [&mut [f32]; 4], v_block: &[f32], p: [&[f32]; 4]) {
-        pv4_neon(acc, v_block, p)
+    fn pv4(&self, acc: [&mut [f32]; 4], v_block: &[f32], p: [&[f32]; 4]) {
+        // SAFETY: `Self` is only constructible via `NeonKernel::new()` (see its docs), which already confirmed the precondition below.
+        unsafe { pv4_neon(acc, v_block, p) }
     }
 
     #[inline]
-    unsafe fn scale_inplace(dst: &mut [f32], scale: f32) {
-        scale_neon(dst, scale)
+    fn scale_inplace(&self, dst: &mut [f32], scale: f32) {
+        // SAFETY: `Self` is only constructible via `NeonKernel::new()` (see its docs), which already confirmed the precondition below.
+        unsafe { scale_neon(dst, scale) }
     }
 
     #[inline]
-    unsafe fn max_reduce(x: &[f32]) -> f32 {
-        max_reduce_neon(x)
+    fn max_reduce(&self, x: &[f32]) -> f32 {
+        // SAFETY: `Self` is only constructible via `NeonKernel::new()` (see its docs), which already confirmed the precondition below.
+        unsafe { max_reduce_neon(x) }
     }
 
     #[inline]
-    unsafe fn max_reduce4(x: [&[f32]; 4]) -> [f32; 4] {
-        max_reduce4_neon(x)
+    fn max_reduce4(&self, x: [&[f32]; 4]) -> [f32; 4] {
+        // SAFETY: `Self` is only constructible via `NeonKernel::new()` (see its docs), which already confirmed the precondition below.
+        unsafe { max_reduce4_neon(x) }
     }
 }
 
@@ -79,32 +98,37 @@ impl Kernel for NeonKernel {
 /// `avx2::dot_avx2`, just 4-lane instead of 8-lane vectors.
 #[target_feature(enable = "neon")]
 unsafe fn dot_neon(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len());
-    let len = a.len();
-    let mut acc0 = vdupq_n_f32(0.0);
-    let mut acc1 = vdupq_n_f32(0.0);
-    let mut i = 0usize;
-    while i + 8 <= len {
-        let a0 = vld1q_f32(a.as_ptr().add(i));
-        let b0 = vld1q_f32(b.as_ptr().add(i));
-        acc0 = vfmaq_f32(acc0, a0, b0);
-        let a1 = vld1q_f32(a.as_ptr().add(i + 4));
-        let b1 = vld1q_f32(b.as_ptr().add(i + 4));
-        acc1 = vfmaq_f32(acc1, a1, b1);
-        i += 8;
+    // SAFETY: `#[target_feature(enable = "...")]` requires the CPU to
+    // actually support it, which holds because NEON is part of the mandatory AArch64 baseline (see the module docs), unlike the x86_64 kernels which need a runtime check.
+    // All raw-pointer loads/stores below stay in bounds: each load reads a fixed-width window starting at `i`; the `i + 8 <= len` guards above ensure every load stays within `a`/`b` (asserted equal length above).
+    unsafe {
+        debug_assert_eq!(a.len(), b.len());
+        let len = a.len();
+        let mut acc0 = vdupq_n_f32(0.0);
+        let mut acc1 = vdupq_n_f32(0.0);
+        let mut i = 0usize;
+        while i + 8 <= len {
+            let a0 = vld1q_f32(a.as_ptr().add(i));
+            let b0 = vld1q_f32(b.as_ptr().add(i));
+            acc0 = vfmaq_f32(acc0, a0, b0);
+            let a1 = vld1q_f32(a.as_ptr().add(i + 4));
+            let b1 = vld1q_f32(b.as_ptr().add(i + 4));
+            acc1 = vfmaq_f32(acc1, a1, b1);
+            i += 8;
+        }
+        while i + 4 <= len {
+            let av = vld1q_f32(a.as_ptr().add(i));
+            let bv = vld1q_f32(b.as_ptr().add(i));
+            acc0 = vfmaq_f32(acc0, av, bv);
+            i += 4;
+        }
+        let mut sum = vaddvq_f32(vaddq_f32(acc0, acc1));
+        while i < len {
+            sum += a[i] * b[i];
+            i += 1;
+        }
+        sum
     }
-    while i + 4 <= len {
-        let av = vld1q_f32(a.as_ptr().add(i));
-        let bv = vld1q_f32(b.as_ptr().add(i));
-        acc0 = vfmaq_f32(acc0, av, bv);
-        i += 4;
-    }
-    let mut sum = vaddvq_f32(vaddq_f32(acc0, acc1));
-    while i < len {
-        sum += a[i] * b[i];
-        i += 1;
-    }
-    sum
 }
 
 /// Four dot products sharing `b`'s vector loads across four independent FMA
@@ -112,38 +136,43 @@ unsafe fn dot_neon(a: &[f32], b: &[f32]) -> f32 {
 /// faster than four separate [`dot_neon`] calls.
 #[target_feature(enable = "neon")]
 unsafe fn dot4_neon(a0: &[f32], a1: &[f32], a2: &[f32], a3: &[f32], b: &[f32]) -> [f32; 4] {
-    debug_assert_eq!(a0.len(), b.len());
-    debug_assert_eq!(a1.len(), b.len());
-    debug_assert_eq!(a2.len(), b.len());
-    debug_assert_eq!(a3.len(), b.len());
-    let len = b.len();
-    let mut acc0 = vdupq_n_f32(0.0);
-    let mut acc1 = vdupq_n_f32(0.0);
-    let mut acc2 = vdupq_n_f32(0.0);
-    let mut acc3 = vdupq_n_f32(0.0);
-    let mut i = 0usize;
-    while i + 4 <= len {
-        let bv = vld1q_f32(b.as_ptr().add(i)); // loaded once, shared 4 ways
-        acc0 = vfmaq_f32(acc0, vld1q_f32(a0.as_ptr().add(i)), bv);
-        acc1 = vfmaq_f32(acc1, vld1q_f32(a1.as_ptr().add(i)), bv);
-        acc2 = vfmaq_f32(acc2, vld1q_f32(a2.as_ptr().add(i)), bv);
-        acc3 = vfmaq_f32(acc3, vld1q_f32(a3.as_ptr().add(i)), bv);
-        i += 4;
+    // SAFETY: `#[target_feature(enable = "...")]` requires the CPU to
+    // actually support it, which holds because NEON is part of the mandatory AArch64 baseline (see the module docs), unlike the x86_64 kernels which need a runtime check.
+    // All raw-pointer loads/stores below stay in bounds: the `i + 4 <= len` guard covers the shared `b` load and all four `a0..a3` loads each iteration (all four asserted equal length to `b` above).
+    unsafe {
+        debug_assert_eq!(a0.len(), b.len());
+        debug_assert_eq!(a1.len(), b.len());
+        debug_assert_eq!(a2.len(), b.len());
+        debug_assert_eq!(a3.len(), b.len());
+        let len = b.len();
+        let mut acc0 = vdupq_n_f32(0.0);
+        let mut acc1 = vdupq_n_f32(0.0);
+        let mut acc2 = vdupq_n_f32(0.0);
+        let mut acc3 = vdupq_n_f32(0.0);
+        let mut i = 0usize;
+        while i + 4 <= len {
+            let bv = vld1q_f32(b.as_ptr().add(i)); // loaded once, shared 4 ways
+            acc0 = vfmaq_f32(acc0, vld1q_f32(a0.as_ptr().add(i)), bv);
+            acc1 = vfmaq_f32(acc1, vld1q_f32(a1.as_ptr().add(i)), bv);
+            acc2 = vfmaq_f32(acc2, vld1q_f32(a2.as_ptr().add(i)), bv);
+            acc3 = vfmaq_f32(acc3, vld1q_f32(a3.as_ptr().add(i)), bv);
+            i += 4;
+        }
+        let mut sums = [
+            vaddvq_f32(acc0),
+            vaddvq_f32(acc1),
+            vaddvq_f32(acc2),
+            vaddvq_f32(acc3),
+        ];
+        while i < len {
+            sums[0] += a0[i] * b[i];
+            sums[1] += a1[i] * b[i];
+            sums[2] += a2[i] * b[i];
+            sums[3] += a3[i] * b[i];
+            i += 1;
+        }
+        sums
     }
-    let mut sums = [
-        vaddvq_f32(acc0),
-        vaddvq_f32(acc1),
-        vaddvq_f32(acc2),
-        vaddvq_f32(acc3),
-    ];
-    while i < len {
-        sums[0] += a0[i] * b[i];
-        sums[1] += a1[i] * b[i];
-        sums[2] += a2[i] * b[i];
-        sums[3] += a3[i] * b[i];
-        i += 1;
-    }
-    sums
 }
 
 /// 4 query rows x 4 key rows blocked together: both operands' vector loads
@@ -151,39 +180,44 @@ unsafe fn dot4_neon(a0: &[f32], a1: &[f32], a2: &[f32], a3: &[f32], b: &[f32]) -
 /// [`crate::kernel::Kernel::dot4x4`].
 #[target_feature(enable = "neon")]
 unsafe fn dot4x4_neon(q: [&[f32]; 4], k: [&[f32]; 4]) -> [[f32; 4]; 4] {
-    let d = q[0].len();
-    let mut acc = [[vdupq_n_f32(0.0); 4]; 4];
-    let mut p = 0usize;
-    while p + 4 <= d {
-        let qv = [
-            vld1q_f32(q[0].as_ptr().add(p)),
-            vld1q_f32(q[1].as_ptr().add(p)),
-            vld1q_f32(q[2].as_ptr().add(p)),
-            vld1q_f32(q[3].as_ptr().add(p)),
-        ];
-        for c in 0..4 {
-            let kv = vld1q_f32(k[c].as_ptr().add(p)); // loaded once, shared 4 ways
-            for r in 0..4 {
-                acc[r][c] = vfmaq_f32(acc[r][c], qv[r], kv);
+    // SAFETY: `#[target_feature(enable = "...")]` requires the CPU to
+    // actually support it, which holds because NEON is part of the mandatory AArch64 baseline (see the module docs), unlike the x86_64 kernels which need a runtime check.
+    // All raw-pointer loads/stores below stay in bounds: the `p + 4 <= d` guard covers all four `q` and four `k` row loads each iteration.
+    unsafe {
+        let d = q[0].len();
+        let mut acc = [[vdupq_n_f32(0.0); 4]; 4];
+        let mut p = 0usize;
+        while p + 4 <= d {
+            let qv = [
+                vld1q_f32(q[0].as_ptr().add(p)),
+                vld1q_f32(q[1].as_ptr().add(p)),
+                vld1q_f32(q[2].as_ptr().add(p)),
+                vld1q_f32(q[3].as_ptr().add(p)),
+            ];
+            for c in 0..4 {
+                let kv = vld1q_f32(k[c].as_ptr().add(p)); // loaded once, shared 4 ways
+                for r in 0..4 {
+                    acc[r][c] = vfmaq_f32(acc[r][c], qv[r], kv);
+                }
             }
+            p += 4;
         }
-        p += 4;
-    }
-    let mut sums = [[0.0f32; 4]; 4];
-    for r in 0..4 {
-        for c in 0..4 {
-            sums[r][c] = vaddvq_f32(acc[r][c]);
-        }
-    }
-    while p < d {
+        let mut sums = [[0.0f32; 4]; 4];
         for r in 0..4 {
             for c in 0..4 {
-                sums[r][c] += q[r][p] * k[c][p];
+                sums[r][c] = vaddvq_f32(acc[r][c]);
             }
         }
-        p += 1;
+        while p < d {
+            for r in 0..4 {
+                for c in 0..4 {
+                    sums[r][c] += q[r][p] * k[c][p];
+                }
+            }
+            p += 1;
+        }
+        sums
     }
-    sums
 }
 
 /// Vectorized exp over 4 lanes. See module docs for the algorithm.
@@ -248,26 +282,31 @@ unsafe fn exp128_ps(x: float32x4_t) -> float32x4_t {
 /// passes).
 #[target_feature(enable = "neon")]
 unsafe fn sub_exp_sum_inplace_neon(x: &mut [f32], m: f32) -> f32 {
-    let len = x.len();
-    let vm = vdupq_n_f32(m);
-    let mut sum_acc = vdupq_n_f32(0.0);
-    let mut i = 0usize;
-    while i + 4 <= len {
-        let v = vld1q_f32(x.as_ptr().add(i));
-        let v = vsubq_f32(v, vm);
-        let r = exp128_ps(v);
-        vst1q_f32(x.as_mut_ptr().add(i), r);
-        sum_acc = vaddq_f32(sum_acc, r);
-        i += 4;
+    // SAFETY: `#[target_feature(enable = "...")]` requires the CPU to
+    // actually support it, which holds because NEON is part of the mandatory AArch64 baseline (see the module docs), unlike the x86_64 kernels which need a runtime check.
+    // All raw-pointer loads/stores below stay in bounds: the `i + 4 <= len` guard covers both the load and the store back to the same index range.
+    unsafe {
+        let len = x.len();
+        let vm = vdupq_n_f32(m);
+        let mut sum_acc = vdupq_n_f32(0.0);
+        let mut i = 0usize;
+        while i + 4 <= len {
+            let v = vld1q_f32(x.as_ptr().add(i));
+            let v = vsubq_f32(v, vm);
+            let r = exp128_ps(v);
+            vst1q_f32(x.as_mut_ptr().add(i), r);
+            sum_acc = vaddq_f32(sum_acc, r);
+            i += 4;
+        }
+        let mut sum = vaddvq_f32(sum_acc);
+        while i < len {
+            let e = (x[i] - m).exp();
+            x[i] = e;
+            sum += e;
+            i += 1;
+        }
+        sum
     }
-    let mut sum = vaddvq_f32(sum_acc);
-    while i < len {
-        let e = (x[i] - m).exp();
-        x[i] = e;
-        sum += e;
-        i += 1;
-    }
-    sum
 }
 
 /// [`sub_exp_sum_inplace_neon`], 4 rows at once with per-row `m` values,
@@ -275,63 +314,73 @@ unsafe fn sub_exp_sum_inplace_neon(x: &mut [f32], m: f32) -> f32 {
 /// [`crate::kernel::Kernel::sub_exp_sum_inplace4`] for why.
 #[target_feature(enable = "neon")]
 unsafe fn sub_exp_sum_inplace4_neon(x: [&mut [f32]; 4], m: [f32; 4]) -> [f32; 4] {
-    let [x0, x1, x2, x3] = x;
-    let len = x0.len();
-    debug_assert_eq!(x1.len(), len);
-    debug_assert_eq!(x2.len(), len);
-    debug_assert_eq!(x3.len(), len);
-    let vm = [
-        vdupq_n_f32(m[0]),
-        vdupq_n_f32(m[1]),
-        vdupq_n_f32(m[2]),
-        vdupq_n_f32(m[3]),
-    ];
-    let mut sum_acc = [vdupq_n_f32(0.0); 4];
-    let mut i = 0usize;
-    while i + 4 <= len {
-        let r0 = exp128_ps(vsubq_f32(vld1q_f32(x0.as_ptr().add(i)), vm[0]));
-        vst1q_f32(x0.as_mut_ptr().add(i), r0);
-        sum_acc[0] = vaddq_f32(sum_acc[0], r0);
-        let r1 = exp128_ps(vsubq_f32(vld1q_f32(x1.as_ptr().add(i)), vm[1]));
-        vst1q_f32(x1.as_mut_ptr().add(i), r1);
-        sum_acc[1] = vaddq_f32(sum_acc[1], r1);
-        let r2 = exp128_ps(vsubq_f32(vld1q_f32(x2.as_ptr().add(i)), vm[2]));
-        vst1q_f32(x2.as_mut_ptr().add(i), r2);
-        sum_acc[2] = vaddq_f32(sum_acc[2], r2);
-        let r3 = exp128_ps(vsubq_f32(vld1q_f32(x3.as_ptr().add(i)), vm[3]));
-        vst1q_f32(x3.as_mut_ptr().add(i), r3);
-        sum_acc[3] = vaddq_f32(sum_acc[3], r3);
-        i += 4;
-    }
-    let mut sum: [f32; 4] = std::array::from_fn(|r| vaddvq_f32(sum_acc[r]));
-    let rows: [&mut [f32]; 4] = [x0, x1, x2, x3];
-    while i < len {
-        for r in 0..4 {
-            let e = (rows[r][i] - m[r]).exp();
-            rows[r][i] = e;
-            sum[r] += e;
+    // SAFETY: `#[target_feature(enable = "...")]` requires the CPU to
+    // actually support it, which holds because NEON is part of the mandatory AArch64 baseline (see the module docs), unlike the x86_64 kernels which need a runtime check.
+    // All raw-pointer loads/stores below stay in bounds: the `i + 4 <= len` guard covers the load/store for all four rows (asserted equal length above).
+    unsafe {
+        let [x0, x1, x2, x3] = x;
+        let len = x0.len();
+        debug_assert_eq!(x1.len(), len);
+        debug_assert_eq!(x2.len(), len);
+        debug_assert_eq!(x3.len(), len);
+        let vm = [
+            vdupq_n_f32(m[0]),
+            vdupq_n_f32(m[1]),
+            vdupq_n_f32(m[2]),
+            vdupq_n_f32(m[3]),
+        ];
+        let mut sum_acc = [vdupq_n_f32(0.0); 4];
+        let mut i = 0usize;
+        while i + 4 <= len {
+            let r0 = exp128_ps(vsubq_f32(vld1q_f32(x0.as_ptr().add(i)), vm[0]));
+            vst1q_f32(x0.as_mut_ptr().add(i), r0);
+            sum_acc[0] = vaddq_f32(sum_acc[0], r0);
+            let r1 = exp128_ps(vsubq_f32(vld1q_f32(x1.as_ptr().add(i)), vm[1]));
+            vst1q_f32(x1.as_mut_ptr().add(i), r1);
+            sum_acc[1] = vaddq_f32(sum_acc[1], r1);
+            let r2 = exp128_ps(vsubq_f32(vld1q_f32(x2.as_ptr().add(i)), vm[2]));
+            vst1q_f32(x2.as_mut_ptr().add(i), r2);
+            sum_acc[2] = vaddq_f32(sum_acc[2], r2);
+            let r3 = exp128_ps(vsubq_f32(vld1q_f32(x3.as_ptr().add(i)), vm[3]));
+            vst1q_f32(x3.as_mut_ptr().add(i), r3);
+            sum_acc[3] = vaddq_f32(sum_acc[3], r3);
+            i += 4;
         }
-        i += 1;
+        let mut sum: [f32; 4] = std::array::from_fn(|r| vaddvq_f32(sum_acc[r]));
+        let rows: [&mut [f32]; 4] = [x0, x1, x2, x3];
+        while i < len {
+            for r in 0..4 {
+                let e = (rows[r][i] - m[r]).exp();
+                rows[r][i] = e;
+                sum[r] += e;
+            }
+            i += 1;
+        }
+        sum
     }
-    sum
 }
 
 #[target_feature(enable = "neon")]
 unsafe fn axpy_neon(dst: &mut [f32], src: &[f32], scale: f32) {
-    debug_assert_eq!(dst.len(), src.len());
-    let len = dst.len();
-    let vscale = vdupq_n_f32(scale);
-    let mut i = 0usize;
-    while i + 4 <= len {
-        let d = vld1q_f32(dst.as_ptr().add(i));
-        let s = vld1q_f32(src.as_ptr().add(i));
-        let r = vfmaq_f32(d, s, vscale);
-        vst1q_f32(dst.as_mut_ptr().add(i), r);
-        i += 4;
-    }
-    while i < len {
-        dst[i] += src[i] * scale;
-        i += 1;
+    // SAFETY: `#[target_feature(enable = "...")]` requires the CPU to
+    // actually support it, which holds because NEON is part of the mandatory AArch64 baseline (see the module docs), unlike the x86_64 kernels which need a runtime check.
+    // All raw-pointer loads/stores below stay in bounds: the `i + 4 <= len` guard covers both the `dst` load/store and the `src` load (asserted equal length above).
+    unsafe {
+        debug_assert_eq!(dst.len(), src.len());
+        let len = dst.len();
+        let vscale = vdupq_n_f32(scale);
+        let mut i = 0usize;
+        while i + 4 <= len {
+            let d = vld1q_f32(dst.as_ptr().add(i));
+            let s = vld1q_f32(src.as_ptr().add(i));
+            let r = vfmaq_f32(d, s, vscale);
+            vst1q_f32(dst.as_mut_ptr().add(i), r);
+            i += 4;
+        }
+        while i < len {
+            dst[i] += src[i] * scale;
+            i += 1;
+        }
     }
 }
 
@@ -349,159 +398,179 @@ unsafe fn axpy_neon(dst: &mut [f32], src: &[f32], scale: f32) {
 /// one leftover lane-of-4, then a scalar tail for the final `d % 4`.
 #[target_feature(enable = "neon")]
 unsafe fn pv4_neon(acc: [&mut [f32]; 4], v_block: &[f32], p: [&[f32]; 4]) {
-    let [a0, a1, a2, a3] = acc;
-    let d = a0.len();
-    debug_assert_eq!(a1.len(), d);
-    debug_assert_eq!(a2.len(), d);
-    debug_assert_eq!(a3.len(), d);
-    let bc = p[0].len();
-    debug_assert_eq!(v_block.len(), bc * d);
-    debug_assert_eq!(p[1].len(), bc);
-    debug_assert_eq!(p[2].len(), bc);
-    debug_assert_eq!(p[3].len(), bc);
+    // SAFETY: `#[target_feature(enable = "...")]` requires the CPU to
+    // actually support it, which holds because NEON is part of the mandatory AArch64 baseline (see the module docs), unlike the x86_64 kernels which need a runtime check.
+    // All raw-pointer loads/stores below stay in bounds: the `chunk + 4/8 <= d` guards cover the `a0..a3` accumulator loads/stores; the inner `j < bc` loop's `v_block` index stays in bounds since `v_block.len() == bc * d` is asserted above and `chunk (+ 4/8) < d` from the outer guard.
+    unsafe {
+        let [a0, a1, a2, a3] = acc;
+        let d = a0.len();
+        debug_assert_eq!(a1.len(), d);
+        debug_assert_eq!(a2.len(), d);
+        debug_assert_eq!(a3.len(), d);
+        let bc = p[0].len();
+        debug_assert_eq!(v_block.len(), bc * d);
+        debug_assert_eq!(p[1].len(), bc);
+        debug_assert_eq!(p[2].len(), bc);
+        debug_assert_eq!(p[3].len(), bc);
 
-    let mut chunk = 0usize;
-    while chunk + 8 <= d {
-        let mut acc0a = vld1q_f32(a0.as_ptr().add(chunk));
-        let mut acc0b = vld1q_f32(a0.as_ptr().add(chunk + 4));
-        let mut acc1a = vld1q_f32(a1.as_ptr().add(chunk));
-        let mut acc1b = vld1q_f32(a1.as_ptr().add(chunk + 4));
-        let mut acc2a = vld1q_f32(a2.as_ptr().add(chunk));
-        let mut acc2b = vld1q_f32(a2.as_ptr().add(chunk + 4));
-        let mut acc3a = vld1q_f32(a3.as_ptr().add(chunk));
-        let mut acc3b = vld1q_f32(a3.as_ptr().add(chunk + 4));
-        let mut j = 0usize;
-        while j < bc {
-            let vva = vld1q_f32(v_block.as_ptr().add(j * d + chunk));
-            let vvb = vld1q_f32(v_block.as_ptr().add(j * d + chunk + 4));
-            let s0 = vdupq_n_f32(p[0][j]);
-            let s1 = vdupq_n_f32(p[1][j]);
-            let s2 = vdupq_n_f32(p[2][j]);
-            let s3 = vdupq_n_f32(p[3][j]);
-            acc0a = vfmaq_f32(acc0a, vva, s0);
-            acc0b = vfmaq_f32(acc0b, vvb, s0);
-            acc1a = vfmaq_f32(acc1a, vva, s1);
-            acc1b = vfmaq_f32(acc1b, vvb, s1);
-            acc2a = vfmaq_f32(acc2a, vva, s2);
-            acc2b = vfmaq_f32(acc2b, vvb, s2);
-            acc3a = vfmaq_f32(acc3a, vva, s3);
-            acc3b = vfmaq_f32(acc3b, vvb, s3);
-            j += 1;
+        let mut chunk = 0usize;
+        while chunk + 8 <= d {
+            let mut acc0a = vld1q_f32(a0.as_ptr().add(chunk));
+            let mut acc0b = vld1q_f32(a0.as_ptr().add(chunk + 4));
+            let mut acc1a = vld1q_f32(a1.as_ptr().add(chunk));
+            let mut acc1b = vld1q_f32(a1.as_ptr().add(chunk + 4));
+            let mut acc2a = vld1q_f32(a2.as_ptr().add(chunk));
+            let mut acc2b = vld1q_f32(a2.as_ptr().add(chunk + 4));
+            let mut acc3a = vld1q_f32(a3.as_ptr().add(chunk));
+            let mut acc3b = vld1q_f32(a3.as_ptr().add(chunk + 4));
+            let mut j = 0usize;
+            while j < bc {
+                let vva = vld1q_f32(v_block.as_ptr().add(j * d + chunk));
+                let vvb = vld1q_f32(v_block.as_ptr().add(j * d + chunk + 4));
+                let s0 = vdupq_n_f32(p[0][j]);
+                let s1 = vdupq_n_f32(p[1][j]);
+                let s2 = vdupq_n_f32(p[2][j]);
+                let s3 = vdupq_n_f32(p[3][j]);
+                acc0a = vfmaq_f32(acc0a, vva, s0);
+                acc0b = vfmaq_f32(acc0b, vvb, s0);
+                acc1a = vfmaq_f32(acc1a, vva, s1);
+                acc1b = vfmaq_f32(acc1b, vvb, s1);
+                acc2a = vfmaq_f32(acc2a, vva, s2);
+                acc2b = vfmaq_f32(acc2b, vvb, s2);
+                acc3a = vfmaq_f32(acc3a, vva, s3);
+                acc3b = vfmaq_f32(acc3b, vvb, s3);
+                j += 1;
+            }
+            vst1q_f32(a0.as_mut_ptr().add(chunk), acc0a);
+            vst1q_f32(a0.as_mut_ptr().add(chunk + 4), acc0b);
+            vst1q_f32(a1.as_mut_ptr().add(chunk), acc1a);
+            vst1q_f32(a1.as_mut_ptr().add(chunk + 4), acc1b);
+            vst1q_f32(a2.as_mut_ptr().add(chunk), acc2a);
+            vst1q_f32(a2.as_mut_ptr().add(chunk + 4), acc2b);
+            vst1q_f32(a3.as_mut_ptr().add(chunk), acc3a);
+            vst1q_f32(a3.as_mut_ptr().add(chunk + 4), acc3b);
+            chunk += 8;
         }
-        vst1q_f32(a0.as_mut_ptr().add(chunk), acc0a);
-        vst1q_f32(a0.as_mut_ptr().add(chunk + 4), acc0b);
-        vst1q_f32(a1.as_mut_ptr().add(chunk), acc1a);
-        vst1q_f32(a1.as_mut_ptr().add(chunk + 4), acc1b);
-        vst1q_f32(a2.as_mut_ptr().add(chunk), acc2a);
-        vst1q_f32(a2.as_mut_ptr().add(chunk + 4), acc2b);
-        vst1q_f32(a3.as_mut_ptr().add(chunk), acc3a);
-        vst1q_f32(a3.as_mut_ptr().add(chunk + 4), acc3b);
-        chunk += 8;
-    }
-    if chunk + 4 <= d {
-        let mut acc0 = vld1q_f32(a0.as_ptr().add(chunk));
-        let mut acc1 = vld1q_f32(a1.as_ptr().add(chunk));
-        let mut acc2 = vld1q_f32(a2.as_ptr().add(chunk));
-        let mut acc3 = vld1q_f32(a3.as_ptr().add(chunk));
-        let mut j = 0usize;
-        while j < bc {
-            let vv = vld1q_f32(v_block.as_ptr().add(j * d + chunk));
-            acc0 = vfmaq_f32(acc0, vv, vdupq_n_f32(p[0][j]));
-            acc1 = vfmaq_f32(acc1, vv, vdupq_n_f32(p[1][j]));
-            acc2 = vfmaq_f32(acc2, vv, vdupq_n_f32(p[2][j]));
-            acc3 = vfmaq_f32(acc3, vv, vdupq_n_f32(p[3][j]));
-            j += 1;
+        if chunk + 4 <= d {
+            let mut acc0 = vld1q_f32(a0.as_ptr().add(chunk));
+            let mut acc1 = vld1q_f32(a1.as_ptr().add(chunk));
+            let mut acc2 = vld1q_f32(a2.as_ptr().add(chunk));
+            let mut acc3 = vld1q_f32(a3.as_ptr().add(chunk));
+            let mut j = 0usize;
+            while j < bc {
+                let vv = vld1q_f32(v_block.as_ptr().add(j * d + chunk));
+                acc0 = vfmaq_f32(acc0, vv, vdupq_n_f32(p[0][j]));
+                acc1 = vfmaq_f32(acc1, vv, vdupq_n_f32(p[1][j]));
+                acc2 = vfmaq_f32(acc2, vv, vdupq_n_f32(p[2][j]));
+                acc3 = vfmaq_f32(acc3, vv, vdupq_n_f32(p[3][j]));
+                j += 1;
+            }
+            vst1q_f32(a0.as_mut_ptr().add(chunk), acc0);
+            vst1q_f32(a1.as_mut_ptr().add(chunk), acc1);
+            vst1q_f32(a2.as_mut_ptr().add(chunk), acc2);
+            vst1q_f32(a3.as_mut_ptr().add(chunk), acc3);
+            chunk += 4;
         }
-        vst1q_f32(a0.as_mut_ptr().add(chunk), acc0);
-        vst1q_f32(a1.as_mut_ptr().add(chunk), acc1);
-        vst1q_f32(a2.as_mut_ptr().add(chunk), acc2);
-        vst1q_f32(a3.as_mut_ptr().add(chunk), acc3);
-        chunk += 4;
-    }
-    while chunk < d {
-        let (mut s0, mut s1, mut s2, mut s3) = (a0[chunk], a1[chunk], a2[chunk], a3[chunk]);
-        let mut j = 0usize;
-        while j < bc {
-            let vv = v_block[j * d + chunk];
-            s0 += vv * p[0][j];
-            s1 += vv * p[1][j];
-            s2 += vv * p[2][j];
-            s3 += vv * p[3][j];
-            j += 1;
+        while chunk < d {
+            let (mut s0, mut s1, mut s2, mut s3) = (a0[chunk], a1[chunk], a2[chunk], a3[chunk]);
+            let mut j = 0usize;
+            while j < bc {
+                let vv = v_block[j * d + chunk];
+                s0 += vv * p[0][j];
+                s1 += vv * p[1][j];
+                s2 += vv * p[2][j];
+                s3 += vv * p[3][j];
+                j += 1;
+            }
+            a0[chunk] = s0;
+            a1[chunk] = s1;
+            a2[chunk] = s2;
+            a3[chunk] = s3;
+            chunk += 1;
         }
-        a0[chunk] = s0;
-        a1[chunk] = s1;
-        a2[chunk] = s2;
-        a3[chunk] = s3;
-        chunk += 1;
     }
 }
 
 #[target_feature(enable = "neon")]
 unsafe fn scale_neon(dst: &mut [f32], scale: f32) {
-    let len = dst.len();
-    let vscale = vdupq_n_f32(scale);
-    let mut i = 0usize;
-    while i + 4 <= len {
-        let d = vld1q_f32(dst.as_ptr().add(i));
-        let r = vmulq_f32(d, vscale);
-        vst1q_f32(dst.as_mut_ptr().add(i), r);
-        i += 4;
-    }
-    while i < len {
-        dst[i] *= scale;
-        i += 1;
+    // SAFETY: `#[target_feature(enable = "...")]` requires the CPU to
+    // actually support it, which holds because NEON is part of the mandatory AArch64 baseline (see the module docs), unlike the x86_64 kernels which need a runtime check.
+    // All raw-pointer loads/stores below stay in bounds: the `i + 4 <= len` guard covers the load and the store back to the same index.
+    unsafe {
+        let len = dst.len();
+        let vscale = vdupq_n_f32(scale);
+        let mut i = 0usize;
+        while i + 4 <= len {
+            let d = vld1q_f32(dst.as_ptr().add(i));
+            let r = vmulq_f32(d, vscale);
+            vst1q_f32(dst.as_mut_ptr().add(i), r);
+            i += 4;
+        }
+        while i < len {
+            dst[i] *= scale;
+            i += 1;
+        }
     }
 }
 
 #[target_feature(enable = "neon")]
 unsafe fn max_reduce_neon(x: &[f32]) -> f32 {
-    let len = x.len();
-    if len == 0 {
-        return f32::NEG_INFINITY;
+    // SAFETY: `#[target_feature(enable = "...")]` requires the CPU to
+    // actually support it, which holds because NEON is part of the mandatory AArch64 baseline (see the module docs), unlike the x86_64 kernels which need a runtime check.
+    // All raw-pointer loads/stores below stay in bounds: the `i + 4 <= len` guard covers the load; the `len == 0` early return above avoids reducing an empty accumulator.
+    unsafe {
+        let len = x.len();
+        if len == 0 {
+            return f32::NEG_INFINITY;
+        }
+        let mut acc = vdupq_n_f32(f32::NEG_INFINITY);
+        let mut i = 0usize;
+        while i + 4 <= len {
+            let v = vld1q_f32(x.as_ptr().add(i));
+            acc = vmaxq_f32(acc, v);
+            i += 4;
+        }
+        let mut m = vmaxvq_f32(acc);
+        while i < len {
+            m = m.max(x[i]);
+            i += 1;
+        }
+        m
     }
-    let mut acc = vdupq_n_f32(f32::NEG_INFINITY);
-    let mut i = 0usize;
-    while i + 4 <= len {
-        let v = vld1q_f32(x.as_ptr().add(i));
-        acc = vmaxq_f32(acc, v);
-        i += 4;
-    }
-    let mut m = vmaxvq_f32(acc);
-    while i < len {
-        m = m.max(x[i]);
-        i += 1;
-    }
-    m
 }
 
 /// [`max_reduce_neon`], 4 rows at once, interleaved into 4 independent
 /// chains — see [`crate::kernel::Kernel::max_reduce4`] for why.
 #[target_feature(enable = "neon")]
 unsafe fn max_reduce4_neon(x: [&[f32]; 4]) -> [f32; 4] {
-    let len = x[0].len();
-    debug_assert_eq!(x[1].len(), len);
-    debug_assert_eq!(x[2].len(), len);
-    debug_assert_eq!(x[3].len(), len);
-    if len == 0 {
-        return [f32::NEG_INFINITY; 4];
-    }
-    let mut acc = [vdupq_n_f32(f32::NEG_INFINITY); 4];
-    let mut i = 0usize;
-    while i + 4 <= len {
-        for r in 0..4 {
-            acc[r] = vmaxq_f32(acc[r], vld1q_f32(x[r].as_ptr().add(i)));
+    // SAFETY: `#[target_feature(enable = "...")]` requires the CPU to
+    // actually support it, which holds because NEON is part of the mandatory AArch64 baseline (see the module docs), unlike the x86_64 kernels which need a runtime check.
+    // All raw-pointer loads/stores below stay in bounds: the `i + 4 <= len` guard covers the load for all four rows (asserted equal length above); the `len == 0` early return above avoids reducing an empty accumulator.
+    unsafe {
+        let len = x[0].len();
+        debug_assert_eq!(x[1].len(), len);
+        debug_assert_eq!(x[2].len(), len);
+        debug_assert_eq!(x[3].len(), len);
+        if len == 0 {
+            return [f32::NEG_INFINITY; 4];
         }
-        i += 4;
-    }
-    let mut m: [f32; 4] = std::array::from_fn(|r| vmaxvq_f32(acc[r]));
-    while i < len {
-        for r in 0..4 {
-            m[r] = m[r].max(x[r][i]);
+        let mut acc = [vdupq_n_f32(f32::NEG_INFINITY); 4];
+        let mut i = 0usize;
+        while i + 4 <= len {
+            for r in 0..4 {
+                acc[r] = vmaxq_f32(acc[r], vld1q_f32(x[r].as_ptr().add(i)));
+            }
+            i += 4;
         }
-        i += 1;
+        let mut m: [f32; 4] = std::array::from_fn(|r| vmaxvq_f32(acc[r]));
+        while i < len {
+            for r in 0..4 {
+                m[r] = m[r].max(x[r][i]);
+            }
+            i += 1;
+        }
+        m
     }
-    m
 }
 
 #[cfg(test)]
@@ -512,6 +581,7 @@ mod tests {
     fn exp_matches_std() {
         let xs: Vec<f32> = (-800..800).map(|i| i as f32 * 0.1).collect();
         let mut got = xs.clone();
+        // SAFETY: test-only; NEON is part of the mandatory AArch64 baseline (see module docs), so no runtime check is needed here, same as the real dispatch.
         let sum = unsafe { sub_exp_sum_inplace_neon(&mut got, 0.0) };
         let mut max_rel_err = 0.0f32;
         for (x, g) in xs.iter().zip(got.iter()) {
@@ -539,6 +609,7 @@ mod tests {
             let a: Vec<f32> = (0..len).map(|i| (i as f32 * 0.37).sin()).collect();
             let b: Vec<f32> = (0..len).map(|i| (i as f32 * 0.71).cos()).collect();
             let scalar: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+            // SAFETY: test-only; NEON is part of the mandatory AArch64 baseline (see module docs), so no runtime check is needed here, same as the real dispatch.
             let simd = unsafe { dot_neon(&a, &b) };
             assert!(
                 (scalar - simd).abs() < 1e-3 * (scalar.abs() + 1.0),
@@ -559,11 +630,16 @@ mod tests {
             let b = mk(0.71);
 
             let want = [
+                // SAFETY: test-only; NEON is part of the mandatory AArch64 baseline (see module docs), so no runtime check is needed here, same as the real dispatch.
                 unsafe { dot_neon(&a0, &b) },
+                // SAFETY: test-only; NEON is part of the mandatory AArch64 baseline (see module docs), so no runtime check is needed here, same as the real dispatch.
                 unsafe { dot_neon(&a1, &b) },
+                // SAFETY: test-only; NEON is part of the mandatory AArch64 baseline (see module docs), so no runtime check is needed here, same as the real dispatch.
                 unsafe { dot_neon(&a2, &b) },
+                // SAFETY: test-only; NEON is part of the mandatory AArch64 baseline (see module docs), so no runtime check is needed here, same as the real dispatch.
                 unsafe { dot_neon(&a3, &b) },
             ];
+            // SAFETY: test-only; NEON is part of the mandatory AArch64 baseline (see module docs), so no runtime check is needed here, same as the real dispatch.
             let got = unsafe { dot4_neon(&a0, &a1, &a2, &a3, &b) };
             for k in 0..4 {
                 assert!(
@@ -584,8 +660,10 @@ mod tests {
             let k = [mk(0.61), mk(0.67), mk(0.73), mk(0.79)];
 
             let want: [[f32; 4]; 4] =
+                // SAFETY: test-only; NEON is part of the mandatory AArch64 baseline (see module docs), so no runtime check is needed here, same as the real dispatch.
                 std::array::from_fn(|r| std::array::from_fn(|c| unsafe { dot_neon(&q[r], &k[c]) }));
             let got =
+                // SAFETY: test-only; NEON is part of the mandatory AArch64 baseline (see module docs), so no runtime check is needed here, same as the real dispatch.
                 unsafe { dot4x4_neon([&q[0], &q[1], &q[2], &q[3]], [&k[0], &k[1], &k[2], &k[3]]) };
             for r in 0..4 {
                 for c in 0..4 {
@@ -623,12 +701,14 @@ mod tests {
             let mut want = init.clone();
             for (row, pr) in want.iter_mut().zip(p.iter()) {
                 for (j, v_row) in v_block.chunks_exact(d).enumerate() {
+                    // SAFETY: test-only; NEON is part of the mandatory AArch64 baseline (see module docs), so no runtime check is needed here, same as the real dispatch.
                     unsafe { axpy_neon(row, v_row, pr[j]) };
                 }
             }
 
             let mut got = init;
             let [g0, g1, g2, g3] = &mut got;
+            // SAFETY: test-only; NEON is part of the mandatory AArch64 baseline (see module docs), so no runtime check is needed here, same as the real dispatch.
             unsafe { pv4_neon([g0, g1, g2, g3], &v_block, [&p[0], &p[1], &p[2], &p[3]]) };
 
             for r in 0..4 {
@@ -649,6 +729,7 @@ mod tests {
         for len in [0usize, 1, 5, 8, 13, 16, 33] {
             let x: Vec<f32> = (0..len).map(|i| ((i as f32) * 1.3).sin() * 5.0).collect();
             let want_max: f32 = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            // SAFETY: test-only; NEON is part of the mandatory AArch64 baseline (see module docs), so no runtime check is needed here, same as the real dispatch.
             let got_max = unsafe { max_reduce_neon(&x) };
             assert_eq!(want_max, got_max, "len={len} max");
         }
@@ -661,11 +742,16 @@ mod tests {
                 |seed: f32| -> Vec<f32> { (0..len).map(|i| (i as f32 * seed).sin()).collect() };
             let rows = [mk(0.11), mk(0.23), mk(0.37), mk(0.51)];
             let want = [
+                // SAFETY: test-only; NEON is part of the mandatory AArch64 baseline (see module docs), so no runtime check is needed here, same as the real dispatch.
                 unsafe { max_reduce_neon(&rows[0]) },
+                // SAFETY: test-only; NEON is part of the mandatory AArch64 baseline (see module docs), so no runtime check is needed here, same as the real dispatch.
                 unsafe { max_reduce_neon(&rows[1]) },
+                // SAFETY: test-only; NEON is part of the mandatory AArch64 baseline (see module docs), so no runtime check is needed here, same as the real dispatch.
                 unsafe { max_reduce_neon(&rows[2]) },
+                // SAFETY: test-only; NEON is part of the mandatory AArch64 baseline (see module docs), so no runtime check is needed here, same as the real dispatch.
                 unsafe { max_reduce_neon(&rows[3]) },
             ];
+            // SAFETY: test-only; NEON is part of the mandatory AArch64 baseline (see module docs), so no runtime check is needed here, same as the real dispatch.
             let got = unsafe { max_reduce4_neon([&rows[0], &rows[1], &rows[2], &rows[3]]) };
             assert_eq!(want, got, "len={len}");
         }
@@ -680,12 +766,14 @@ mod tests {
             let m = [0.1f32, -0.3, 0.5, 0.0];
 
             let mut want_rows = [mk(0.11), mk(0.23), mk(0.37), mk(0.51)];
+            // SAFETY: test-only; NEON is part of the mandatory AArch64 baseline (see module docs), so no runtime check is needed here, same as the real dispatch.
             let want_sums: [f32; 4] = std::array::from_fn(|r| unsafe {
                 sub_exp_sum_inplace_neon(&mut want_rows[r], m[r])
             });
 
             let mut got_rows = [mk(0.11), mk(0.23), mk(0.37), mk(0.51)];
             let [g0, g1, g2, g3] = &mut got_rows;
+            // SAFETY: test-only; NEON is part of the mandatory AArch64 baseline (see module docs), so no runtime check is needed here, same as the real dispatch.
             let got_sums = unsafe { sub_exp_sum_inplace4_neon([g0, g1, g2, g3], m) };
 
             for r in 0..4 {
@@ -717,6 +805,7 @@ mod tests {
             for (d, s) in want.iter_mut().zip(src.iter()) {
                 *d += s * scale;
             }
+            // SAFETY: test-only; NEON is part of the mandatory AArch64 baseline (see module docs), so no runtime check is needed here, same as the real dispatch.
             unsafe { axpy_neon(&mut dst, &src, scale) };
             for (w, g) in want.iter().zip(dst.iter()) {
                 assert!((w - g).abs() < 1e-4, "axpy len={len}");
@@ -724,6 +813,7 @@ mod tests {
 
             let mut d2 = want.clone();
             let want2: Vec<f32> = d2.iter().map(|v| v * 2.5).collect();
+            // SAFETY: test-only; NEON is part of the mandatory AArch64 baseline (see module docs), so no runtime check is needed here, same as the real dispatch.
             unsafe { scale_neon(&mut d2, 2.5) };
             for (w, g) in want2.iter().zip(d2.iter()) {
                 assert!((w - g).abs() < 1e-4, "scale len={len}");

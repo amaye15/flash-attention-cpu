@@ -74,32 +74,62 @@ pub fn flash_attention_v3(
 
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx512f") {
-            run_v3::<Avx512Kernel>(q, k, v, seq_len_q, seq_len_k, d_head, config, out);
+        if let Some(kernel) = Avx512Kernel::new() {
+            run_v3(&kernel, q, k, v, seq_len_q, seq_len_k, d_head, config, out);
             return;
         }
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            run_v3::<Avx2Kernel>(q, k, v, seq_len_q, seq_len_k, d_head, config, out);
+        if let Some(kernel) = Avx2Kernel::new() {
+            run_v3(&kernel, q, k, v, seq_len_q, seq_len_k, d_head, config, out);
             return;
         }
-        if is_x86_feature_detected!("sse4.1") {
-            run_v3::<Sse41Kernel>(q, k, v, seq_len_q, seq_len_k, d_head, config, out);
+        if let Some(kernel) = Sse41Kernel::new() {
+            run_v3(&kernel, q, k, v, seq_len_q, seq_len_k, d_head, config, out);
             return;
         }
     }
     #[cfg(target_arch = "aarch64")]
     {
-        run_v3::<NeonKernel>(q, k, v, seq_len_q, seq_len_k, d_head, config, out);
+        run_v3(
+            &NeonKernel::new(),
+            q,
+            k,
+            v,
+            seq_len_q,
+            seq_len_k,
+            d_head,
+            config,
+            out,
+        );
     }
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     {
-        run_v3::<Simd128Kernel>(q, k, v, seq_len_q, seq_len_k, d_head, config, out);
+        run_v3(
+            &Simd128Kernel::new(),
+            q,
+            k,
+            v,
+            seq_len_q,
+            seq_len_k,
+            d_head,
+            config,
+            out,
+        );
     }
     #[cfg(not(any(
         target_arch = "aarch64",
         all(target_arch = "wasm32", target_feature = "simd128")
     )))]
-    run_v3::<ScalarKernel>(q, k, v, seq_len_q, seq_len_k, d_head, config, out);
+    run_v3(
+        &ScalarKernel::new(),
+        q,
+        k,
+        v,
+        seq_len_q,
+        seq_len_k,
+        d_head,
+        config,
+        out,
+    );
 }
 
 /// Batched multi-head attention. See [`flash_attention_v3`] for the
@@ -145,6 +175,7 @@ pub fn flash_attention_multihead_v3(
 /// ahead of the previous tile's [`finish_tile`].
 #[allow(clippy::too_many_arguments)]
 fn compute_tile<K: Kernel + Sync>(
+    kernel: &K,
     q_block: &[f32],
     k: &[f32],
     d_head: usize,
@@ -175,7 +206,7 @@ fn compute_tile<K: Kernel + Sync>(
             let k1 = &k_block[(j + 1) * d_head..(j + 2) * d_head];
             let k2 = &k_block[(j + 2) * d_head..(j + 3) * d_head];
             let k3 = &k_block[(j + 3) * d_head..(j + 4) * d_head];
-            let s = unsafe { K::dot4x4(qg, [k0, k1, k2, k3]) };
+            let s = kernel.dot4x4(qg, [k0, k1, k2, k3]);
             for r in 0..4 {
                 for c in 0..4 {
                     scores_slice[(i + r) * this_bc + (j + c)] = s[r][c] * scale;
@@ -185,7 +216,7 @@ fn compute_tile<K: Kernel + Sync>(
         }
         while j < this_bc {
             let kj_row = &k_block[j * d_head..(j + 1) * d_head];
-            let [s0, s1, s2, s3] = unsafe { K::dot4(q0, q1, q2, q3, kj_row) };
+            let [s0, s1, s2, s3] = kernel.dot4(q0, q1, q2, q3, kj_row);
             scores_slice[i * this_bc + j] = s0 * scale;
             scores_slice[(i + 1) * this_bc + j] = s1 * scale;
             scores_slice[(i + 2) * this_bc + j] = s2 * scale;
@@ -198,7 +229,7 @@ fn compute_tile<K: Kernel + Sync>(
         let qi_row = &q_block[i * d_head..(i + 1) * d_head];
         let s_row = &mut scores_slice[i * this_bc..(i + 1) * this_bc];
         for (s, kj_row) in s_row.iter_mut().zip(k_block.chunks_exact(d_head)) {
-            *s = unsafe { K::dot(qi_row, kj_row) } * scale;
+            *s = kernel.dot(qi_row, kj_row) * scale;
         }
         i += 1;
     }
@@ -234,6 +265,7 @@ fn compute_tile<K: Kernel + Sync>(
 /// reordered across tiles.
 #[allow(clippy::too_many_arguments)]
 fn finish_tile<K: Kernel + Sync>(
+    kernel: &K,
     scores: &mut [f32],
     v_block: &[f32],
     d_head: usize,
@@ -256,32 +288,32 @@ fn finish_tile<K: Kernel + Sync>(
         let s2 = chunks.next().unwrap();
         let s3 = chunks.next().unwrap();
 
-        let block_max = unsafe { K::max_reduce4([&*s0, &*s1, &*s2, &*s3]) };
+        let block_max = kernel.max_reduce4([&*s0, &*s1, &*s2, &*s3]);
         let new_m: [f32; 4] = std::array::from_fn(|r| m[i + r].max(block_max[r]));
 
-        let block_sum = unsafe { K::sub_exp_sum_inplace4([s0, s1, s2, s3], new_m) };
+        let block_sum = kernel.sub_exp_sum_inplace4([s0, s1, s2, s3], new_m);
 
         for r in 0..4 {
             let correction = (m[i + r] - new_m[r]).exp();
             l[i + r] = correction * l[i + r] + block_sum[r];
             let acc_row = &mut acc[(i + r) * d_head..(i + r + 1) * d_head];
-            unsafe { K::scale_inplace(acc_row, correction) };
+            kernel.scale_inplace(acc_row, correction);
             m[i + r] = new_m[r];
         }
         i += 4;
     }
     while i < this_br {
         let s_row = &mut scores[i * this_bc..(i + 1) * this_bc];
-        let block_max = unsafe { K::max_reduce(s_row) };
+        let block_max = kernel.max_reduce(s_row);
         let new_m = m[i].max(block_max);
 
-        let block_sum = unsafe { K::sub_exp_sum_inplace(s_row, new_m) };
+        let block_sum = kernel.sub_exp_sum_inplace(s_row, new_m);
         let correction = (m[i] - new_m).exp();
 
         l[i] = correction * l[i] + block_sum;
 
         let acc_row = &mut acc[i * d_head..(i + 1) * d_head];
-        unsafe { K::scale_inplace(acc_row, correction) };
+        kernel.scale_inplace(acc_row, correction);
 
         m[i] = new_m;
         i += 1;
@@ -302,14 +334,14 @@ fn finish_tile<K: Kernel + Sync>(
         let p2 = &scores[(i + 2) * this_bc..(i + 3) * this_bc];
         let p3 = &scores[(i + 3) * this_bc..(i + 4) * this_bc];
 
-        unsafe { K::pv4([d0, d1, d2, d3], v_block, [p0, p1, p2, p3]) };
+        kernel.pv4([d0, d1, d2, d3], v_block, [p0, p1, p2, p3]);
         i += 4;
     }
     while i < this_br {
         let s_row = &scores[i * this_bc..(i + 1) * this_bc];
         let acc_row = &mut acc[i * d_head..(i + 1) * d_head];
         for (v_row, &p) in v_block.chunks_exact(d_head).zip(s_row.iter()) {
-            unsafe { K::axpy(acc_row, v_row, p) };
+            kernel.axpy(acc_row, v_row, p);
         }
         i += 1;
     }
@@ -317,6 +349,7 @@ fn finish_tile<K: Kernel + Sync>(
 
 #[allow(clippy::too_many_arguments)]
 fn run_v3<K: Kernel + Sync>(
+    kernel: &K,
     q: &[f32],
     k: &[f32],
     v: &[f32],
@@ -390,7 +423,8 @@ fn run_v3<K: Kernel + Sync>(
             let tile_len = |kj: usize| bc.min(seq_len_k - kj * bc);
 
             // Prologue: issue tile 0's QK^T + mask.
-            compute_tile::<K>(
+            compute_tile(
+                kernel,
                 q_block,
                 k,
                 d_head,
@@ -418,7 +452,8 @@ fn run_v3<K: Kernel + Sync>(
                 } else {
                     (&mut b[0], &mut a[0])
                 };
-                compute_tile::<K>(
+                compute_tile(
+                    kernel,
                     q_block,
                     k,
                     d_head,
@@ -434,7 +469,8 @@ fn run_v3<K: Kernel + Sync>(
                 let this_bc_cur = tile_len(kj);
                 let k_start_cur = kj * bc;
                 let v_block = &v[k_start_cur * d_head..(k_start_cur + this_bc_cur) * d_head];
-                finish_tile::<K>(
+                finish_tile(
+                    kernel,
                     &mut cur_buf[..this_br * this_bc_cur],
                     v_block,
                     d_head,
@@ -451,7 +487,8 @@ fn run_v3<K: Kernel + Sync>(
             let this_bc_last = tile_len(last);
             let k_start_last = last * bc;
             let v_block = &v[k_start_last * d_head..(k_start_last + this_bc_last) * d_head];
-            finish_tile::<K>(
+            finish_tile(
+                kernel,
                 &mut buf[last & 1][..this_br * this_bc_last],
                 v_block,
                 d_head,
@@ -490,6 +527,7 @@ mod tests {
     }
 
     fn check_kernel_cfg<K: Kernel + Sync>(
+        kernel: &K,
         seq_q: usize,
         seq_k: usize,
         d: usize,
@@ -507,7 +545,7 @@ mod tests {
         };
 
         let mut out = vec![0.0f32; seq_q * d];
-        run_v3::<K>(&q, &k, &v, seq_q, seq_k, d, &config, &mut out);
+        run_v3(kernel, &q, &k, &v, seq_q, seq_k, d, &config, &mut out);
 
         let mut out_naive = vec![0.0f32; seq_q * d];
         naive_attention(&q, &k, &v, seq_q, seq_k, d, causal, &mut out_naive);
@@ -519,15 +557,21 @@ mod tests {
         assert!(diff < 1e-3, "diff {diff} too large (br={br} bc={bc})");
     }
 
-    fn check_kernel<K: Kernel + Sync>(seq_q: usize, seq_k: usize, d: usize, causal: bool) {
-        check_kernel_cfg::<K>(seq_q, seq_k, d, causal, 16, 24);
+    fn check_kernel<K: Kernel + Sync>(
+        kernel: &K,
+        seq_q: usize,
+        seq_k: usize,
+        d: usize,
+        causal: bool,
+    ) {
+        check_kernel_cfg(kernel, seq_q, seq_k, d, causal, 16, 24);
     }
 
     #[test]
     fn scalar_kernel_matches_naive() {
-        check_kernel::<ScalarKernel>(53, 71, 40, false);
-        check_kernel::<ScalarKernel>(53, 71, 40, true);
-        check_kernel::<ScalarKernel>(1, 1, 8, true);
+        check_kernel(&ScalarKernel::new(), 53, 71, 40, false);
+        check_kernel(&ScalarKernel::new(), 53, 71, 40, true);
+        check_kernel(&ScalarKernel::new(), 1, 1, 8, true);
     }
 
     #[test]
@@ -536,9 +580,9 @@ mod tests {
         if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
             return;
         }
-        check_kernel::<Avx2Kernel>(53, 71, 40, false);
-        check_kernel::<Avx2Kernel>(53, 71, 40, true);
-        check_kernel::<Avx2Kernel>(1, 1, 8, true);
+        check_kernel(&Avx2Kernel::new().unwrap(), 53, 71, 40, false);
+        check_kernel(&Avx2Kernel::new().unwrap(), 53, 71, 40, true);
+        check_kernel(&Avx2Kernel::new().unwrap(), 1, 1, 8, true);
     }
 
     #[test]
@@ -557,10 +601,30 @@ mod tests {
                 };
 
                 let mut out_scalar = vec![0.0f32; seq_q * d];
-                run_v3::<ScalarKernel>(&q, &k, &v, seq_q, seq_k, d, &config, &mut out_scalar);
+                run_v3(
+                    &ScalarKernel::new(),
+                    &q,
+                    &k,
+                    &v,
+                    seq_q,
+                    seq_k,
+                    d,
+                    &config,
+                    &mut out_scalar,
+                );
 
                 let mut out_avx2 = vec![0.0f32; seq_q * d];
-                run_v3::<Avx2Kernel>(&q, &k, &v, seq_q, seq_k, d, &config, &mut out_avx2);
+                run_v3(
+                    &Avx2Kernel::new().unwrap(),
+                    &q,
+                    &k,
+                    &v,
+                    seq_q,
+                    seq_k,
+                    d,
+                    &config,
+                    &mut out_avx2,
+                );
 
                 let diff = out_scalar
                     .iter()
@@ -577,9 +641,9 @@ mod tests {
         if !is_x86_feature_detected!("sse4.1") {
             return;
         }
-        check_kernel::<Sse41Kernel>(53, 71, 40, false);
-        check_kernel::<Sse41Kernel>(53, 71, 40, true);
-        check_kernel::<Sse41Kernel>(1, 1, 8, true);
+        check_kernel(&Sse41Kernel::new().unwrap(), 53, 71, 40, false);
+        check_kernel(&Sse41Kernel::new().unwrap(), 53, 71, 40, true);
+        check_kernel(&Sse41Kernel::new().unwrap(), 1, 1, 8, true);
     }
 
     #[test]
@@ -598,10 +662,30 @@ mod tests {
                 };
 
                 let mut out_scalar = vec![0.0f32; seq_q * d];
-                run_v3::<ScalarKernel>(&q, &k, &v, seq_q, seq_k, d, &config, &mut out_scalar);
+                run_v3(
+                    &ScalarKernel::new(),
+                    &q,
+                    &k,
+                    &v,
+                    seq_q,
+                    seq_k,
+                    d,
+                    &config,
+                    &mut out_scalar,
+                );
 
                 let mut out_sse41 = vec![0.0f32; seq_q * d];
-                run_v3::<Sse41Kernel>(&q, &k, &v, seq_q, seq_k, d, &config, &mut out_sse41);
+                run_v3(
+                    &Sse41Kernel::new().unwrap(),
+                    &q,
+                    &k,
+                    &v,
+                    seq_q,
+                    seq_k,
+                    d,
+                    &config,
+                    &mut out_sse41,
+                );
 
                 let diff = out_scalar
                     .iter()
@@ -618,9 +702,9 @@ mod tests {
         if !is_x86_feature_detected!("avx512f") {
             return;
         }
-        check_kernel::<Avx512Kernel>(53, 71, 40, false);
-        check_kernel::<Avx512Kernel>(53, 71, 40, true);
-        check_kernel::<Avx512Kernel>(1, 1, 8, true);
+        check_kernel(&Avx512Kernel::new().unwrap(), 53, 71, 40, false);
+        check_kernel(&Avx512Kernel::new().unwrap(), 53, 71, 40, true);
+        check_kernel(&Avx512Kernel::new().unwrap(), 1, 1, 8, true);
     }
 
     #[test]
@@ -639,10 +723,30 @@ mod tests {
                 };
 
                 let mut out_scalar = vec![0.0f32; seq_q * d];
-                run_v3::<ScalarKernel>(&q, &k, &v, seq_q, seq_k, d, &config, &mut out_scalar);
+                run_v3(
+                    &ScalarKernel::new(),
+                    &q,
+                    &k,
+                    &v,
+                    seq_q,
+                    seq_k,
+                    d,
+                    &config,
+                    &mut out_scalar,
+                );
 
                 let mut out_avx512 = vec![0.0f32; seq_q * d];
-                run_v3::<Avx512Kernel>(&q, &k, &v, seq_q, seq_k, d, &config, &mut out_avx512);
+                run_v3(
+                    &Avx512Kernel::new().unwrap(),
+                    &q,
+                    &k,
+                    &v,
+                    seq_q,
+                    seq_k,
+                    d,
+                    &config,
+                    &mut out_avx512,
+                );
 
                 let diff = out_scalar
                     .iter()
@@ -656,9 +760,9 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn neon_kernel_matches_naive() {
-        check_kernel::<NeonKernel>(53, 71, 40, false);
-        check_kernel::<NeonKernel>(53, 71, 40, true);
-        check_kernel::<NeonKernel>(1, 1, 8, true);
+        check_kernel(&NeonKernel::new(), 53, 71, 40, false);
+        check_kernel(&NeonKernel::new(), 53, 71, 40, true);
+        check_kernel(&NeonKernel::new(), 1, 1, 8, true);
     }
 
     #[test]
@@ -675,10 +779,30 @@ mod tests {
         };
 
         let mut out_scalar = vec![0.0f32; seq_q * d];
-        run_v3::<ScalarKernel>(&q, &k, &v, seq_q, seq_k, d, &config, &mut out_scalar);
+        run_v3(
+            &ScalarKernel::new(),
+            &q,
+            &k,
+            &v,
+            seq_q,
+            seq_k,
+            d,
+            &config,
+            &mut out_scalar,
+        );
 
         let mut out_neon = vec![0.0f32; seq_q * d];
-        run_v3::<NeonKernel>(&q, &k, &v, seq_q, seq_k, d, &config, &mut out_neon);
+        run_v3(
+            &NeonKernel::new(),
+            &q,
+            &k,
+            &v,
+            seq_q,
+            seq_k,
+            d,
+            &config,
+            &mut out_neon,
+        );
 
         let diff = out_scalar
             .iter()
@@ -690,9 +814,9 @@ mod tests {
     #[test]
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     fn simd128_kernel_matches_naive() {
-        check_kernel::<Simd128Kernel>(53, 71, 40, false);
-        check_kernel::<Simd128Kernel>(53, 71, 40, true);
-        check_kernel::<Simd128Kernel>(1, 1, 8, true);
+        check_kernel(&Simd128Kernel::new(), 53, 71, 40, false);
+        check_kernel(&Simd128Kernel::new(), 53, 71, 40, true);
+        check_kernel(&Simd128Kernel::new(), 1, 1, 8, true);
     }
 
     #[test]
@@ -709,10 +833,30 @@ mod tests {
         };
 
         let mut out_scalar = vec![0.0f32; seq_q * d];
-        run_v3::<ScalarKernel>(&q, &k, &v, seq_q, seq_k, d, &config, &mut out_scalar);
+        run_v3(
+            &ScalarKernel::new(),
+            &q,
+            &k,
+            &v,
+            seq_q,
+            seq_k,
+            d,
+            &config,
+            &mut out_scalar,
+        );
 
         let mut out_simd128 = vec![0.0f32; seq_q * d];
-        run_v3::<Simd128Kernel>(&q, &k, &v, seq_q, seq_k, d, &config, &mut out_simd128);
+        run_v3(
+            &Simd128Kernel::new(),
+            &q,
+            &k,
+            &v,
+            seq_q,
+            seq_k,
+            d,
+            &config,
+            &mut out_simd128,
+        );
 
         let diff = out_scalar
             .iter()
@@ -727,21 +871,21 @@ mod tests {
     #[test]
     fn pipeline_last_kj_is_one() {
         // seq_k=8, bc=64 => a single kv block covers everything.
-        check_kernel_cfg::<ScalarKernel>(10, 8, 16, false, 4, 64);
-        check_kernel_cfg::<ScalarKernel>(10, 8, 16, true, 4, 64);
+        check_kernel_cfg(&ScalarKernel::new(), 10, 8, 16, false, 4, 64);
+        check_kernel_cfg(&ScalarKernel::new(), 10, 8, 16, true, 4, 64);
     }
 
     #[test]
     fn pipeline_last_kj_is_two() {
         // seq_k=48, bc=24 => exactly 2 kv blocks.
-        check_kernel_cfg::<ScalarKernel>(48, 48, 16, false, 16, 24);
-        check_kernel_cfg::<ScalarKernel>(48, 48, 16, true, 16, 24);
+        check_kernel_cfg(&ScalarKernel::new(), 48, 48, 16, false, 16, 24);
+        check_kernel_cfg(&ScalarKernel::new(), 48, 48, 16, true, 16, 24);
     }
 
     #[test]
     fn pipeline_last_kj_is_three_or_more() {
         // seq_k=71, bc=24 => 71.div_ceil(24) == 3 kv blocks.
-        check_kernel::<ScalarKernel>(53, 71, 40, false);
-        check_kernel::<ScalarKernel>(53, 71, 40, true);
+        check_kernel(&ScalarKernel::new(), 53, 71, 40, false);
+        check_kernel(&ScalarKernel::new(), 53, 71, 40, true);
     }
 }

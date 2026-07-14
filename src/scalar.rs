@@ -4,6 +4,10 @@
 //! `simd128.rs`). Written as plain iterator code so LLVM can still
 //! autovectorize it reasonably well (SSE2 on the x86_64 baseline, NEON on
 //! aarch64).
+//!
+//! Every method is plain safe Rust — no intrinsics, so no precondition to
+//! prove and nothing for `Self::new()` to check. This is the one `Kernel`
+//! impl in the crate with zero `unsafe` in it, start to finish.
 
 use crate::kernel::Kernel;
 
@@ -22,36 +26,51 @@ use crate::kernel::Kernel;
 )]
 pub(crate) struct ScalarKernel;
 
+impl ScalarKernel {
+    /// Always succeeds — this kernel does nothing actually unsafe
+    /// internally, so there's no precondition to check.
+    #[cfg_attr(
+        any(
+            all(target_arch = "aarch64", not(test)),
+            all(target_arch = "wasm32", target_feature = "simd128", not(test))
+        ),
+        allow(dead_code)
+    )]
+    pub(crate) fn new() -> Self {
+        Self
+    }
+}
+
 impl Kernel for ScalarKernel {
     #[inline]
-    unsafe fn dot(a: &[f32], b: &[f32]) -> f32 {
+    fn dot(&self, a: &[f32], b: &[f32]) -> f32 {
         debug_assert_eq!(a.len(), b.len());
         a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
     }
 
     #[inline]
-    unsafe fn dot4(a0: &[f32], a1: &[f32], a2: &[f32], a3: &[f32], b: &[f32]) -> [f32; 4] {
+    fn dot4(&self, a0: &[f32], a1: &[f32], a2: &[f32], a3: &[f32], b: &[f32]) -> [f32; 4] {
         // No register-blocking benefit possible without SIMD lanes to
         // share loads across — this exists purely so call sites in
         // `v1.rs`/`v2.rs`/`v3.rs` don't need an arch-specific branch.
         [
-            Self::dot(a0, b),
-            Self::dot(a1, b),
-            Self::dot(a2, b),
-            Self::dot(a3, b),
+            self.dot(a0, b),
+            self.dot(a1, b),
+            self.dot(a2, b),
+            self.dot(a3, b),
         ]
     }
 
     #[inline]
-    unsafe fn dot4x4(q: [&[f32]; 4], k: [&[f32]; 4]) -> [[f32; 4]; 4] {
+    fn dot4x4(&self, q: [&[f32]; 4], k: [&[f32]; 4]) -> [[f32; 4]; 4] {
         // No register-blocking benefit possible without SIMD lanes to
         // share loads across — this exists purely so call sites in
         // `v1.rs`/`v2.rs`/`v3.rs` don't need an arch-specific branch.
-        std::array::from_fn(|r| std::array::from_fn(|c| Self::dot(q[r], k[c])))
+        std::array::from_fn(|r| std::array::from_fn(|c| self.dot(q[r], k[c])))
     }
 
     #[inline]
-    unsafe fn sub_exp_sum_inplace(x: &mut [f32], m: f32) -> f32 {
+    fn sub_exp_sum_inplace(&self, x: &mut [f32], m: f32) -> f32 {
         let mut sum = 0.0f32;
         for v in x.iter_mut() {
             *v = (*v - m).exp();
@@ -61,7 +80,7 @@ impl Kernel for ScalarKernel {
     }
 
     #[inline]
-    unsafe fn axpy(dst: &mut [f32], src: &[f32], scale: f32) {
+    fn axpy(&self, dst: &mut [f32], src: &[f32], scale: f32) {
         debug_assert_eq!(dst.len(), src.len());
         for (d, s) in dst.iter_mut().zip(src.iter()) {
             *d += s * scale;
@@ -69,45 +88,45 @@ impl Kernel for ScalarKernel {
     }
 
     #[inline]
-    unsafe fn pv4(acc: [&mut [f32]; 4], v_block: &[f32], p: [&[f32]; 4]) {
+    fn pv4(&self, acc: [&mut [f32]; 4], v_block: &[f32], p: [&[f32]; 4]) {
         let [a0, a1, a2, a3] = acc;
         let d = a0.len();
         for (j, v_row) in v_block.chunks_exact(d).enumerate() {
-            Self::axpy(a0, v_row, p[0][j]);
-            Self::axpy(a1, v_row, p[1][j]);
-            Self::axpy(a2, v_row, p[2][j]);
-            Self::axpy(a3, v_row, p[3][j]);
+            self.axpy(a0, v_row, p[0][j]);
+            self.axpy(a1, v_row, p[1][j]);
+            self.axpy(a2, v_row, p[2][j]);
+            self.axpy(a3, v_row, p[3][j]);
         }
     }
 
     #[inline]
-    unsafe fn scale_inplace(dst: &mut [f32], scale: f32) {
+    fn scale_inplace(&self, dst: &mut [f32], scale: f32) {
         for d in dst.iter_mut() {
             *d *= scale;
         }
     }
 
     #[inline]
-    unsafe fn max_reduce(x: &[f32]) -> f32 {
+    fn max_reduce(&self, x: &[f32]) -> f32 {
         x.iter().copied().fold(f32::NEG_INFINITY, f32::max)
     }
 
     #[inline]
-    unsafe fn max_reduce4(x: [&[f32]; 4]) -> [f32; 4] {
+    fn max_reduce4(&self, x: [&[f32]; 4]) -> [f32; 4] {
         // No ILP benefit possible without independent SIMD chains to
         // interleave — this exists purely so call sites don't need an
         // arch-specific branch.
-        std::array::from_fn(|r| Self::max_reduce(x[r]))
+        std::array::from_fn(|r| self.max_reduce(x[r]))
     }
 
     #[inline]
-    unsafe fn sub_exp_sum_inplace4(x: [&mut [f32]; 4], m: [f32; 4]) -> [f32; 4] {
+    fn sub_exp_sum_inplace4(&self, x: [&mut [f32]; 4], m: [f32; 4]) -> [f32; 4] {
         let [x0, x1, x2, x3] = x;
         [
-            Self::sub_exp_sum_inplace(x0, m[0]),
-            Self::sub_exp_sum_inplace(x1, m[1]),
-            Self::sub_exp_sum_inplace(x2, m[2]),
-            Self::sub_exp_sum_inplace(x3, m[3]),
+            self.sub_exp_sum_inplace(x0, m[0]),
+            self.sub_exp_sum_inplace(x1, m[1]),
+            self.sub_exp_sum_inplace(x2, m[2]),
+            self.sub_exp_sum_inplace(x3, m[3]),
         ]
     }
 }

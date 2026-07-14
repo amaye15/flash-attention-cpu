@@ -7,6 +7,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Implemented all three tiers of `UNSAFE.md`'s unsafe-minimization plan:
+  - **Tier 0**: enabled `clippy::missing_safety_doc`,
+    `clippy::undocumented_unsafe_blocks`, and `#![warn(unsafe_op_in_unsafe_fn)]`
+    (verified to work on stable Rust, edition 2021, no bump needed), then
+    wrote real `// SAFETY:` justifications for every `unsafe fn`/`unsafe {}`
+    in the crate (160+ locations) — not placeholders, actual per-function
+    and per-block reasoning (CPU-feature preconditions, loop-guard bounds
+    arguments).
+  - **Tier 1**: redesigned the `Kernel` trait around a "CPU feature token"
+    pattern. Every method is now a safe `&self` fn; `Avx2Kernel`/
+    `Avx512Kernel`/`Sse41Kernel::new() -> Option<Self>` perform
+    `is_x86_feature_detected!` exactly once, and simply possessing the
+    resulting value is the proof every other method needs;
+    `NeonKernel`/`Simd128Kernel`/`ScalarKernel::new() -> Self` are
+    infallible (mandatory baseline / compile-time `#[cfg(...)]` gate / no
+    precondition at all, respectively). Measured result: `unsafe fn` count
+    133 → 62 (−53%); `v1.rs`/`v2.rs`/`v3.rs` went from 34 `unsafe` blocks to
+    0; `scalar.rs` (which never did anything actually unsafe internally,
+    only forced into `unsafe fn` by the old trait signature) went from 10
+    `unsafe fn`/5 blocks to 0. No behavior or performance change — the ZST
+    tokens monomorphize away identically to the old static dispatch.
+  - **Tier 2**: prototyped and benchmarked adopting the `pulp` crate for
+    the register-blocked arithmetic primitives, not completed. Real,
+    2-way-unrolled-vs-2-way-unrolled benchmarks on this sandbox's aarch64
+    host show pulp performs on par with (sometimes faster than) this
+    crate's hand-tuned `dot_neon` once matched to the same register-blocking
+    shape — a naive single-accumulator pulp version had measured
+    1.2–1.9x slower first, which is why the shape match mattered. But
+    `exp()`'s IEEE-754 bit-manipulation technique (used by all five
+    existing kernels) needs integer arithmetic pulp's `Simd` trait doesn't
+    expose at all — confirmed by exhaustively grepping its source, not a
+    missed API. The floor/round half of that gap *is* solved (the "magic
+    number" rounding trick was checked numerically against 1.78M points in
+    this crate's actual clamp range and measured zero difference in final
+    `exp()` accuracy), but without integer add or a float-to-int
+    conversion there's no way to finish the exponent-bit reconstruction.
+    Completing a "pulp port" today would mean either overstating the
+    result (still shipping hand-written unsafe for `exp()`) or inventing
+    and separately validating a new float-only `exp()` algorithm — neither
+    done here. See `UNSAFE.md`'s Tier 2 section for the full writeup and
+    what a future attempt would need.
+
+- `UNSAFE.md`: a from-scratch audit of this crate's unsafe code (133
+  `unsafe fn`, ~140 `unsafe` blocks, measured directly, not estimated),
+  researching how to minimize it without touching hot-path codegen.
+  Distinguishes what's actually irreducible (calling `std::arch`
+  intrinsics) from what's pure ceremony — `scalar.rs`'s entire kernel (10
+  `unsafe fn`) does nothing unsafe internally, forced only by `Kernel`'s
+  shared trait signature, and `v1.rs`/`v2.rs`/`v3.rs`'s ~35 call-site
+  `unsafe` blocks are thin wrappers already downstream of a completed
+  `is_x86_feature_detected!` check. Lays out a phased plan: Tier 0
+  (`clippy::missing_safety_doc`/`undocumented_unsafe_blocks`,
+  `unsafe_op_in_unsafe_fn` — all verified to work on stable Rust, edition
+  2021, no bump needed), Tier 1 (a "CPU feature token" pattern eliminating
+  unsafe at the orchestration layer, no new dependency), and Tier 2 (a
+  scoped evaluation of adopting the `pulp` crate for 4 of 5 SIMD backends
+  — verified directly, not from docs alone, including that its AVX-512
+  support now compiles on stable Rust as of v0.22.3, that it has no
+  packed-floor primitive this crate's `exp` implementations depend on,
+  and that it has no sub-AVX2 x86 tier so the just-shipped `sse41.rs`
+  would need to stay hand-written regardless). Also directly verified
+  (installed nightly + Miri, ran it for real) that this crate's AVX2,
+  AVX-512F, and SSE4.1 kernels all pass completely under Miri via
+  cross-target interpretation, while the NEON kernel currently fails on
+  an unimplemented horizontal-add intrinsic — concrete grounds for adding
+  a scoped Miri CI job rather than assuming Miri either works or doesn't.
+  No code changed this round — research and plan only.
+
 ## [0.2.0] - 2026-07-14
 
 First published release on crates.io.

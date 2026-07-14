@@ -8,17 +8,26 @@
 
 /// Numeric primitives used by the flash-attention inner loop.
 ///
-/// All methods are `unsafe fn` so that [`crate::avx2::Avx2Kernel`],
-/// [`crate::sse41::Sse41Kernel`], [`crate::neon::NeonKernel`], and
-/// [`crate::scalar::ScalarKernel`] share one signature: the AVX2/SSE4.1
-/// implementations are only sound to call after checking
-/// `is_x86_feature_detected!("avx2")` / `"fma"` / `"sse4.1"` respectively,
-/// which each variant's entry point does once, up front, before selecting a
-/// kernel type. NEON needs no such check — it's part of the mandatory
-/// AArch64 baseline.
+/// Every method takes `&self` and is **safe** to call — the "CPU feature
+/// token" pattern: [`crate::avx2::Avx2Kernel`], [`crate::avx512::Avx512Kernel`],
+/// and [`crate::sse41::Sse41Kernel`] can only be *constructed* through their
+/// respective (fallible) `new()` associated functions, which perform
+/// `is_x86_feature_detected!("avx2")` / `"fma"` / `"avx512f"` / `"sse4.1"`
+/// exactly once, up front. Simply *possessing* a value of one of these
+/// types is therefore proof the check already passed, so every method can
+/// be safe: the one `unsafe` intrinsic call each method needs internally is
+/// justified by `Self`'s constructor having run, not by the caller
+/// promising anything. [`crate::neon::NeonKernel`]/[`crate::simd128::Simd128Kernel`]/
+/// [`crate::scalar::ScalarKernel`]'s `new()` are infallible (NEON is
+/// mandatory AArch64 baseline; SIMD128 is a compile-time `#[cfg(...)]` gate;
+/// scalar has no precondition at all) — see each type's own docs.
+///
+/// This eliminates `unsafe` at the call sites in `v1.rs`/`v2.rs`/`v3.rs`
+/// entirely: those only ever hold a `&K` obtained from a `new()` that
+/// already ran, so there's nothing left for the caller to promise.
 pub(crate) trait Kernel {
     /// Dot product of two equal-length slices.
-    unsafe fn dot(a: &[f32], b: &[f32]) -> f32;
+    fn dot(&self, a: &[f32], b: &[f32]) -> f32;
 
     /// `[dot(a0, b), dot(a1, b), dot(a2, b), dot(a3, b)]` — four dot
     /// products sharing one another's `b` vector loads. Register-blocking:
@@ -26,7 +35,7 @@ pub(crate) trait Kernel {
     /// accumulator chains instead of `b` being reloaded once per query row.
     /// Used for the `this_bc % 4` remainder columns [`Kernel::dot4x4`]
     /// leaves over.
-    unsafe fn dot4(a0: &[f32], a1: &[f32], a2: &[f32], a3: &[f32], b: &[f32]) -> [f32; 4];
+    fn dot4(&self, a0: &[f32], a1: &[f32], a2: &[f32], a3: &[f32], b: &[f32]) -> [f32; 4];
 
     /// `result[r][c] = dot(q[r], k[c])` for `r, c` in `0..4` — 4 query rows
     /// *and* 4 key rows blocked together ("packed" register tiling,
@@ -37,16 +46,16 @@ pub(crate) trait Kernel {
     /// on every key row, since nothing keeps them resident across that
     /// loop. Measured ~1.5-1.6x throughput improvement over `dot4` alone on
     /// the QK^T step (see the crate's benchmarks).
-    unsafe fn dot4x4(q: [&[f32]; 4], k: [&[f32]; 4]) -> [[f32; 4]; 4];
+    fn dot4x4(&self, q: [&[f32]; 4], k: [&[f32]; 4]) -> [[f32; 4]; 4];
 
     /// Fused in-place `x[i] = exp(x[i] - m)` for all `i`, returning
     /// `sum(x)` *after* the exponential — one pass over `x` instead of a
     /// separate subtract-exp pass followed by a separate sum reduction,
     /// since every call site (online-softmax bookkeeping) needs both.
-    unsafe fn sub_exp_sum_inplace(x: &mut [f32], m: f32) -> f32;
+    fn sub_exp_sum_inplace(&self, x: &mut [f32], m: f32) -> f32;
 
     /// `dst[i] += src[i] * scale` for all `i` (equal-length slices).
-    unsafe fn axpy(dst: &mut [f32], src: &[f32], scale: f32);
+    fn axpy(&self, dst: &mut [f32], src: &[f32], scale: f32);
 
     /// PV accumulation for a 4-query-row group against a whole KV tile:
     /// `acc[r][i] += sum_j p[r][j] * v_block[j][i]` for `r` in `0..4`,
@@ -64,13 +73,13 @@ pub(crate) trait Kernel {
     /// concurrent independent work to hide FMA latency — doubling the
     /// chain count measured a further ~1.8-2.3x on top of the original
     /// one-`axpy`-per-V-row pattern's ~1.2x (see the crate's benchmarks).
-    unsafe fn pv4(acc: [&mut [f32]; 4], v_block: &[f32], p: [&[f32]; 4]);
+    fn pv4(&self, acc: [&mut [f32]; 4], v_block: &[f32], p: [&[f32]; 4]);
 
     /// `dst[i] *= scale` for all `i`.
-    unsafe fn scale_inplace(dst: &mut [f32], scale: f32);
+    fn scale_inplace(&self, dst: &mut [f32], scale: f32);
 
     /// Max over all elements. Empty slice returns `-inf`.
-    unsafe fn max_reduce(x: &[f32]) -> f32;
+    fn max_reduce(&self, x: &[f32]) -> f32;
 
     /// `[max_reduce(x[0]), max_reduce(x[1]), max_reduce(x[2]), max_reduce(x[3])]`
     /// — 4 independent max-reduction chains interleaved instead of 4
@@ -81,9 +90,9 @@ pub(crate) trait Kernel {
     /// the same class of problem [`Kernel::pv4`] has. Used for the bulk of
     /// the online-softmax bookkeeping loop's row-max step, with the
     /// existing [`Kernel::max_reduce`] as the `this_br % 4` remainder.
-    unsafe fn max_reduce4(x: [&[f32]; 4]) -> [f32; 4];
+    fn max_reduce4(&self, x: [&[f32]; 4]) -> [f32; 4];
 
     /// [`Kernel::sub_exp_sum_inplace`], 4 rows at once with per-row `m`
     /// values interleaved for the same reason as [`Kernel::max_reduce4`].
-    unsafe fn sub_exp_sum_inplace4(x: [&mut [f32]; 4], m: [f32; 4]) -> [f32; 4];
+    fn sub_exp_sum_inplace4(&self, x: [&mut [f32]; 4], m: [f32; 4]) -> [f32; 4];
 }
