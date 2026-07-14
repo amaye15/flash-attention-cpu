@@ -38,6 +38,8 @@ use crate::neon::NeonKernel;
 use crate::scalar::ScalarKernel;
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 use crate::simd128::Simd128Kernel;
+#[cfg(target_arch = "x86_64")]
+use crate::sse41::Sse41Kernel;
 use rayon::prelude::*;
 
 /// Single-head scaled dot-product attention via v2's algorithm with
@@ -78,6 +80,10 @@ pub fn flash_attention_v3(
         }
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             run_v3::<Avx2Kernel>(q, k, v, seq_len_q, seq_len_k, d_head, config, out);
+            return;
+        }
+        if is_x86_feature_detected!("sse4.1") {
+            run_v3::<Sse41Kernel>(q, k, v, seq_len_q, seq_len_k, d_head, config, out);
             return;
         }
     }
@@ -561,6 +567,47 @@ mod tests {
                     .zip(out_avx2.iter())
                     .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
                 assert!(diff < 1e-3, "scalar/avx2 diff {diff} too large");
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sse41_kernel_matches_naive() {
+        if !is_x86_feature_detected!("sse4.1") {
+            return;
+        }
+        check_kernel::<Sse41Kernel>(53, 71, 40, false);
+        check_kernel::<Sse41Kernel>(53, 71, 40, true);
+        check_kernel::<Sse41Kernel>(1, 1, 8, true);
+    }
+
+    #[test]
+    fn scalar_and_sse41_agree_with_each_other() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("sse4.1") {
+                let (seq_q, seq_k, d) = (65, 90, 48);
+                let q = random_vec(seq_q * d, 4);
+                let k = random_vec(seq_k * d, 5);
+                let v = random_vec(seq_k * d, 6);
+                let config = FlashAttentionConfig {
+                    block_size_q: 32,
+                    block_size_kv: 32,
+                    causal: true,
+                };
+
+                let mut out_scalar = vec![0.0f32; seq_q * d];
+                run_v3::<ScalarKernel>(&q, &k, &v, seq_q, seq_k, d, &config, &mut out_scalar);
+
+                let mut out_sse41 = vec![0.0f32; seq_q * d];
+                run_v3::<Sse41Kernel>(&q, &k, &v, seq_q, seq_k, d, &config, &mut out_sse41);
+
+                let diff = out_scalar
+                    .iter()
+                    .zip(out_sse41.iter())
+                    .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+                assert!(diff < 1e-3, "scalar/sse41 diff {diff} too large");
             }
         }
     }

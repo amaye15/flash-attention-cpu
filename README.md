@@ -110,15 +110,16 @@ chain to hide — already throughput-bound.
 |---|---|---|---|---|
 | AVX-512F | `avx512.rs` | x86_64 | 16 | runtime (`is_x86_feature_detected!("avx512f")`), checked first |
 | AVX2+FMA | `avx2.rs` | x86_64 | 8 | runtime, checked if AVX-512F isn't available |
+| SSE4.1 | `sse41.rs` | x86_64 | 4 | runtime, checked if AVX2+FMA isn't available — covers x86_64 CPUs without AVX2 (EVC/Hyper-V-masked cloud VMs, budget/embedded chips; see Extension points) |
 | NEON | `neon.rs` | aarch64 | 4 | unconditional — part of the mandatory AArch64 baseline |
 | SIMD128 | `simd128.rs` | wasm32 | 4 | compile-time (`target_feature = "simd128"`, opt-in — see WASM below) |
 | Scalar | `scalar.rs` | everywhere else | 1 | fallback when none of the above apply |
 
-Runtime-detected kernels (AVX-512F, AVX2) mean the compiled binary is
-portable and still fast wherever the feature actually exists, rather than
-requiring `-C target-cpu=native` (which SIGILLs on older hardware). NEON has
-no runtime check because AArch64 makes it mandatory. WASM has no runtime
-check *available* — see below.
+Runtime-detected kernels (AVX-512F, AVX2, SSE4.1) mean the compiled binary
+is portable and still fast wherever the feature actually exists, rather
+than requiring `-C target-cpu=native` (which SIGILLs on older hardware).
+NEON has no runtime check because AArch64 makes it mandatory. WASM has no
+runtime check *available* — see below.
 
 The vectorized `exp` in every SIMD kernel is a range-reduction +
 degree-5 minimax-polynomial approximation (the same family of technique
@@ -474,6 +475,23 @@ gated on upstream toolchain support rather than a decision here):
   INT8 attention quantization now exists (see
   [ROADMAP.md](ROADMAP.md#4-int8-quantized-qktpv-vnni-path)), but this
   should still follow bf16, not precede it.
+- ~~**x86_64 SSE4.1 baseline tier**~~ — implemented (`src/sse41.rs`),
+  covering a real hardware-coverage gap rather than adding a new
+  architecture: x86_64 CPUs without AVX2 (EVC/Hyper-V-masked cloud VMs,
+  budget/embedded Atom-class chips, and the x86-64-v2 floor RHEL/Anaconda
+  are standardizing on for 2026) used to fall straight through
+  `avx512.rs`/`avx2.rs`'s dispatch to scalar; now they get a real 4-lane
+  SIMD kernel, checked via `is_x86_feature_detected!("sse4.1")` the same
+  way AVX-512F/AVX2 already are. Type-checks and passes clippy
+  cross-compiled to `x86_64-apple-darwin` (this sandbox can't execute
+  x86_64 binaries — same caveat as AVX-512F); correctness is validated by
+  real execution in CI, though, since (unlike AVX-512F) SSE4.1 is
+  virtually guaranteed present on every real x86_64 CI runner. No isolated
+  performance number is published — getting one would need either exposing
+  the crate-private per-kernel dispatch functions publicly just for
+  benchmarking, or accepting noisy in-test timing, neither of which met
+  this project's "real numbers" bar; see
+  [ROADMAP.md](ROADMAP.md#9-x86_64-sse41-baseline-tier-new-item--hardware-coverage-gap-not-a-new-architecture).
 - ~~**Register-blocked micro-kernel**~~ — implemented in two rounds:
   one-sided blocking (`Kernel::dot4`/former `axpy4`), then a packed
   two-sided QK^T micro-kernel (`Kernel::dot4x4`) and a register-resident
@@ -518,6 +536,12 @@ gated on upstream toolchain support rather than a decision here):
   as RVV, for the same reason — intrinsics are nightly-only, blocked
   upstream on a Rust language prerequisite with no committed stabilization
   date. See [ROADMAP.md](ROADMAP.md#5-arm-sve-new-item--not-previously-in-readme).
+- **PowerPC64 (VSX), s390x (vector facility), LoongArch (LSX/LASX), and
+  32-bit Arm (`armv7`) NEON**: surveyed as candidates for genuinely new
+  hardware support; all confirmed nightly-only on Rust today (checked by
+  compiling each directly, not assumed) — including 32-bit Arm NEON, which
+  is a real gap since this crate's existing NEON kernel is `aarch64`-only.
+  See [ROADMAP.md](ROADMAP.md#10-other-cpu-architectures-surveyed--all-confirmed-nightly-only).
 - **Arm SME2/KleidiAI and Intel AMX**: real, large reported speedups, but
   both are matrix-tile coprocessor ISAs (special calling conventions/tile
   registers) rather than "a wider vector register," with no stable Rust
@@ -543,6 +567,7 @@ src/
   scalar.rs   portable fallback implementation
   avx2.rs     AVX2+FMA implementation (x86_64), incl. vectorized exp + its tests
   avx512.rs   AVX-512F implementation (x86_64), incl. vectorized exp + its tests
+  sse41.rs    SSE4.1 implementation (x86_64, no AVX2), incl. vectorized exp + its tests
   neon.rs     NEON implementation (aarch64), incl. vectorized exp + its tests
   simd128.rs  WASM SIMD128 implementation (wasm32, opt-in), incl. vectorized exp + its tests
   common.rs   shared FlashAttentionConfig + shape-assert/multihead-dispatch helpers

@@ -23,8 +23,10 @@
 //!   materializing the full `[seq_len_q, seq_len_k]` score matrix.
 //! - **SIMD** for the dot products, softmax, and weighted-sum inner loops,
 //!   including a hand-vectorized `exp`, tiered per target: on x86_64,
-//!   AVX-512F (16 lanes) ahead of AVX2+FMA (8 lanes) ahead of scalar, all
-//!   selected via runtime feature detection (`is_x86_feature_detected!`);
+//!   AVX-512F (16 lanes) ahead of AVX2+FMA (8 lanes) ahead of SSE4.1
+//!   (4 lanes, no native FMA — covers x86_64 CPUs without AVX2, e.g.
+//!   EVC/Hyper-V-masked cloud VMs or budget/embedded chips) ahead of scalar,
+//!   all selected via runtime feature detection (`is_x86_feature_detected!`);
 //!   on aarch64, NEON (4 lanes) selected unconditionally — it's part of the
 //!   mandatory AArch64 baseline, so no runtime check is needed; on wasm32,
 //!   SIMD128 (4 lanes) selected at compile time when built with
@@ -64,6 +66,8 @@ mod neon;
 mod scalar;
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 mod simd128;
+#[cfg(target_arch = "x86_64")]
+mod sse41;
 pub mod v1;
 pub mod v2;
 pub mod v3;

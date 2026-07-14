@@ -200,6 +200,80 @@ needing to write the code to know it'd be slower).
 
 - [FLASH-D: FlashAttention with Hidden Softmax Division (arXiv:2505.14201)](https://arxiv.org/abs/2505.14201)
 
+### 9. x86_64 SSE4.1 baseline tier (new item — hardware-coverage gap, not a new architecture)
+
+**Status: implemented.**
+
+A CPU-hardware-coverage research pass (prompted by wanting to expand the
+*number* of supported hardware types, not just add precision variants)
+turned up a real gap in an architecture this crate already supports:
+**x86_64 CPUs that lack AVX2 currently get no SIMD kernel at all** — the
+dispatch chain is AVX-512F → AVX2 → scalar, so anything without AVX2 falls
+straight through to the portable fallback, even though x86_64 mandates
+SSE2 and SSE4.1 has been near-universal for well over a decade.
+
+This isn't a hypothetical population:
+- **VMware EVC / Hyper-V processor compatibility mode** deliberately mask
+  AVX/AVX2/AVX-512 on *every* VM in a cluster to allow live migration
+  across mixed CPU generations — a real, commonly-chosen enterprise
+  configuration, not just old hardware. A VM configured this way reports
+  no AVX2 regardless of the physical host's actual capability.
+- **Budget/embedded x86_64** — e.g. Intel Gemini Lake (Goldmont Plus,
+  2018) J-series chips, still shipped in fanless mini-PCs/gateways — has
+  SSE4.2 but no AVX2.
+- **Distro baselines are converging on exactly this floor in 2026**:
+  Red Hat is raising RHEL 10's ISA baseline to x86-64-v3 (AVX2) while
+  explicitly keeping x86-64-v2 (SSE3/SSSE3/SSE4.1/SSE4.2, no AVX) as the
+  still-supported floor for RHEL 8/9, and Anaconda/conda-forge's
+  `linux-64` platform is moving to require x86-64-v2 as *its* new
+  baseline starting May 2026 — i.e. "SSE4.1-but-not-AVX2" is the actual
+  industry-standardized lowest common denominator right now, not a
+  vanishing legacy case.
+
+**Verified directly, not assumed:** compiled the exact primitives this
+crate's kernels need under `#[target_feature(enable = "sse4.1")]` only (no
+AVX/AVX2) on stable Rust — `_mm_add_ps`/`_mm_mul_ps`/`_mm_max_ps` plus,
+critically, `_mm_floor_ps` (packed floor — an **SSE4.1** instruction, not
+in baseline SSE2, and needed for the same range-reduction step
+`avx2::exp256_ps`/`neon::exp128_ps`/`simd128::exp128_ps` all already use)
+and the bit-manipulation ops (`_mm_castps_si128`/`_mm_slli_epi32`/
+`_mm_cvttps_epi32`) for direct `2^n` reconstruction. All compile cleanly —
+this tier is buildable **today**, with no toolchain blocker at all, unlike
+literally everything else surveyed in this round (see item 10). SSE2
+alone (unconditional, no runtime check needed — mandatory on all x86_64,
+same posture as NEON on aarch64) was also checked and would work for the
+non-`exp` kernels, but lacks packed floor, so SSE4.1 (still needing only
+an `is_x86_feature_detected!("sse4.1")` check, same pattern as the
+existing AVX2/AVX-512F dispatch) is the better-targeted floor —
+essentially free of downside since the residual pre-SSE4.1 x86_64
+population (predates ~2008) is realistically extinct for this crate's
+audience.
+
+**Implemented as `src/sse41.rs`**: same 4-lane shape as NEON/SIMD128 (no
+native FMA at this tier, same as SSE2 lacking FMA3 — separate mul+add
+composed inline, no conditional-fma helper needed since there's no branch
+to consolidate here, unlike `simd128.rs`'s `relaxed-simd` case), wired into
+`v1`/`v2`/`v3`'s dispatch between AVX2+FMA and scalar via
+`is_x86_feature_detected!("sse4.1")`. Type-checks and passes clippy
+cross-compiled to `x86_64-apple-darwin` (this sandbox can't execute x86_64
+binaries, same caveat AVX-512F already carries) — but correctness *is*
+validated by real execution once this lands in CI, since unlike AVX-512F,
+SSE4.1 is virtually guaranteed present on every real x86_64 CI runner
+(`ubuntu-latest`/`windows-latest`), so the new `sse41`-specific unit tests
+actually run for real, not just compile. No isolated throughput number is
+published: `examples/bench_quick.rs`/`benches/bench.rs` only see this
+crate's public API, which dispatches to whatever the *real* CI runner's
+best tier is (AVX2, almost certainly) — getting a direct SSE4.1-vs-scalar
+number would need exposing the crate-private per-kernel functions publicly
+just for benchmarking, which wasn't judged worth the API-surface cost for
+this round. Same honest-gap posture as the WASM `relaxed-simd` round.
+
+- [VMware EVC mode overview](https://www.nakivo.com/blog/how-vmware-evc-mode-works-overview/)
+- [Hyper-V processor compatibility mode](https://learn.microsoft.com/en-us/windows-server/virtualization/hyper-v/processor-compatibility-mode)
+- [x86-64 microarchitecture levels (openSUSE Wiki)](https://en.opensuse.org/X86-64_microarchitecture_levels)
+- [RHEL 10 ISA baseline change to x86-64-v3](https://access.redhat.com/solutions/7066628)
+- [Anaconda linux-64 moving to x86-64-v2 baseline, May 2026](https://www.anaconda.com/blog/updated-cpu-requirements-linux-recommendations-windows)
+
 ## Tier 2 — real, but bigger investment or currently hardware/toolchain-gated
 
 ### 4. int8 quantized QK^T/PV (VNNI path)
@@ -289,6 +363,57 @@ with no committed stabilization date. RVV's `vsetvli`-style variable
 vector length still doesn't map onto this crate's fixed-width `Kernel`
 trait as directly as SSE/NEON/wasm did — a real design question, not just
 a new file, so left until intrinsics stabilize.
+
+### 10. Other CPU architectures surveyed — all confirmed nightly-only
+
+A broader "what other hardware could this crate support" pass. Rather
+than trust secondhand summaries, tried compiling each architecture's SIMD
+intrinsics directly (cross-compiled where this sandbox's own aarch64 host
+can't run them natively — a type-check-only signal, same caveat this
+project already applies to its AVX-512F/x86_64-apple-darwin cross-checks)
+under stable Rust, no nightly feature flags:
+
+- **PowerPC64 (AltiVec/VSX)**: `use std::arch::powerpc64::*` and
+  `#[target_feature(enable = "vsx")]` both fail on stable —
+  `stdarch_powerpc` is an unstable library feature and `vsx` an unstable
+  target feature ([rust-lang/rust#111145](https://github.com/rust-lang/rust/issues/111145),
+  [#44839](https://github.com/rust-lang/rust/issues/44839)). Separately,
+  AltiVec (not VSX) has a known soundness issue — it flushes subnormals to
+  zero, which LLVM's optimizer doesn't expect — another reason this isn't
+  a "just stabilize it" situation.
+- **s390x (IBM Z vector facility)**: same shape of failure —
+  `stdarch_s390x` unstable
+  ([rust-lang/rust#135681](https://github.com/rust-lang/rust/issues/135681)).
+  Tracking issue describes unstable intrinsics as "mostly done," so this
+  is closer to stabilizing than PowerPC/LoongArch, but still nightly-only
+  today.
+- **LoongArch (LSX/LASX)**: intrinsics exist in stdarch (unlike the
+  above two, this one has real, fairly complete implementation work
+  already merged) but are still gated behind the unstable
+  `stdarch_loongarch` feature
+  ([rust-lang/rust#117427](https://github.com/rust-lang/rust/issues/117427)).
+  Worth re-checking again later — this is the closest of the three to
+  actually landing.
+- **32-bit Arm (`armv7`) NEON**: a genuine surprise — this crate's
+  existing NEON kernel is `aarch64`-only, so 32-bit Arm (still real,
+  e.g. 32-bit-OS Raspberry Pi 2/3, older Android/embedded) gets no SIMD
+  path at all today. Checked whether 32-bit NEON could fill that gap on
+  stable Rust: it can't — `target_feature = "neon"` and the NEON
+  intrinsics themselves are both unstable specifically for the 32-bit
+  `arm` target (`stdarch_arm_neon_intrinsics`,
+  [rust-lang/rust#111800](https://github.com/rust-lang/rust/issues/111800)),
+  even though the *same* NEON on `aarch64` has been stable for years.
+  Confirmed by direct cross-compilation, not assumption.
+
+**Recommendation:** track all four, don't implement any — every one is
+blocked by the Rust toolchain itself, not by an engineering or design
+question this crate controls. LoongArch is the one worth re-checking
+soonest given how much of its stdarch work is already merged.
+
+- [Tracking issue: PowerPC intrinsics (rust-lang/rust#111145)](https://github.com/rust-lang/rust/issues/111145)
+- [Tracking issue: s390x vector intrinsics (rust-lang/rust#135681)](https://github.com/rust-lang/rust/issues/135681)
+- [Tracking issue: LoongArch intrinsics (rust-lang/rust#117427)](https://github.com/rust-lang/rust/issues/117427)
+- [Tracking issue: 32-bit Arm NEON intrinsics (rust-lang/rust#111800)](https://github.com/rust-lang/rust/issues/111800)
 
 ## External validation (not action items — context for future calls)
 

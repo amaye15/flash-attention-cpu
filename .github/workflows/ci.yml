@@ -44,7 +44,7 @@ jobs:
         shell: bash
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then
-            grep -m1 flags /proc/cpuinfo | tr ' ' '\n' | grep -E '^(avx2|avx512f|fma)$' || true
+            grep -m1 flags /proc/cpuinfo | tr ' ' '\n' | grep -E '^(avx2|avx512f|fma|sse4_1)$' || true
           elif [ "$RUNNER_OS" = "macOS" ]; then
             sysctl -a 2>/dev/null | grep -i 'hw.optional.neon' || true
           else

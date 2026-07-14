@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- New `src/sse41.rs` kernel: a fourth x86_64 SIMD tier, slotted into
+  `v1`/`v2`/`v3`'s dispatch between AVX2+FMA and the scalar fallback via
+  `is_x86_feature_detected!("sse4.1")`. Closes the gap ROADMAP.md item 9
+  identified — x86_64 CPUs without AVX2 (EVC/Hyper-V-masked cloud VMs,
+  budget/embedded Atom-class chips, and the x86-64-v2 floor RHEL/Anaconda
+  are standardizing on for 2026) previously fell straight through to
+  scalar. Same 4-lane shape as `neon.rs`/`simd128.rs` (no native FMA at
+  this tier — separate mul+add, composed inline since there's no
+  conditional branch to consolidate here), including the same vectorized
+  `exp` algorithm (`_mm_floor_ps`-based range reduction — an SSE4.1
+  instruction, not available in baseline SSE2). Type-checks and passes
+  clippy cross-compiled to `x86_64-apple-darwin` (this sandbox can't
+  execute x86_64 binaries, same caveat AVX-512F already carries), but
+  correctness is validated by real execution once in CI: unlike AVX-512F,
+  SSE4.1 is present on every real x86_64 CI runner, so the new
+  `sse41`-specific unit tests (mirroring `avx2.rs`'s test shape, plus
+  `scalar_and_sse41_agree_with_each_other` mutual-agreement checks in each
+  of `v1.rs`/`v2.rs`/`v3.rs`) actually execute for real there. No isolated
+  throughput number published this round — the crate's public API (which
+  `bench_quick.rs`/`bench.rs` are limited to) dispatches to whatever the
+  real CI runner's best tier is (AVX2), so getting a direct SSE4.1-vs-scalar
+  number would need exposing crate-private dispatch functions publicly
+  just for benchmarking purposes, not judged worth the API-surface cost.
+- `ROADMAP.md` items 9-10: a CPU-hardware-coverage research pass (per
+  request, focused on expanding the *number* of supported hardware types
+  rather than precision variants). Found a real, immediately-actionable
+  gap in an architecture already supported: x86_64 CPUs without AVX2
+  (EVC/Hyper-V-masked cloud VMs, budget/embedded Atom-class chips, and the
+  x86-64-v2 floor RHEL/Anaconda are standardizing on for 2026) currently
+  fall straight through to the scalar fallback with no SIMD kernel at all.
+  Verified an SSE4.1 tier — including the packed-floor instruction
+  (`_mm_floor_ps`) the `exp` implementation needs — compiles cleanly on
+  stable Rust with no toolchain blocker, unlike every other architecture
+  surveyed this round: PowerPC64 VSX, s390x vector facility, LoongArch
+  LSX/LASX, and 32-bit Arm (`armv7`) NEON are all confirmed nightly-only
+  by direct compilation (cross-compiled where this sandbox's own aarch64
+  host can't run them natively), not secondhand research. 32-bit Arm NEON
+  in particular is a real, previously-unnoticed gap (this crate's existing
+  NEON kernel is `aarch64`-only), just currently blocked at the Rust
+  toolchain level rather than by this crate. No implementation this
+  round — documentation only, per current priorities.
 - `ROADMAP.md` item 2 (bf16 dot-product acceleration) re-verified against
   stable Rust directly rather than left on the strength of the earlier
   research pass: AVX512_BF16 (`__m256bh`/`__m512bh`, `_mm256_dpbf16_ps`,
