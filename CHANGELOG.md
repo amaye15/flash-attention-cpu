@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-14
+
+First published release on crates.io.
+
 ### Added
 
 - New `src/sse41.rs` kernel: a fourth x86_64 SIMD tier, slotted into

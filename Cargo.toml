@@ -1,6 +1,6 @@
 [package]
 name = "flash-attention-cpu"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.89"
 description = "Pure-Rust, CPU-optimized Flash Attention: tiled online-softmax, AVX-512/AVX2/NEON/WASM-SIMD128 with scalar fallback, Rayon parallelism."

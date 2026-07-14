@@ -1,0 +1,46 @@
+name: Publish to crates.io
+
+# Deliberately gated on a GitHub Release being published, not a bare tag
+# push — creating a Release is the one manual, visible-in-the-UI step
+# before this fires. Publishing to crates.io can't be undone (only
+# yanked), so this workflow re-verifies the version and re-runs the test
+# suite itself rather than trusting that whatever ref got released already
+# passed CI — belt and suspenders for an irreversible action.
+on:
+  release:
+    types: [published]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: cargo publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: verify Cargo.toml version matches the release tag
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg_version=$(grep -m1 '^version' Cargo.toml | sed -E 's/version *= *"(.*)"/\1/')
+          if [ "$tag" != "$pkg_version" ]; then
+            echo "::error::release tag '$GITHUB_REF_NAME' (-> '$tag') doesn't match Cargo.toml version '$pkg_version'"
+            exit 1
+          fi
+          echo "tag '$GITHUB_REF_NAME' matches Cargo.toml version '$pkg_version'"
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo test --release (final correctness gate before publishing)
+        run: cargo test --release
+
+      - name: cargo publish --dry-run (packaging sanity check)
+        run: cargo publish --dry-run
+
+      - name: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish

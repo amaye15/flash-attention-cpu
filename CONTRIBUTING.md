@@ -146,3 +146,20 @@ published surface.)
 New dependencies are checked by `cargo deny check` (config in `deny.toml`)
 for license compatibility, security advisories, and duplicate/banned
 crates — CI runs this on every PR via `EmbarkStudios/cargo-deny-action`.
+
+## Releasing
+
+Publishing to crates.io is automated (`.github/workflows/publish.yml`),
+gated on a GitHub Release being published — not a bare tag push — so
+there's one deliberate, visible-in-the-UI step before an irreversible
+action (crates.io has no delete, only yank) fires:
+
+1. Bump `version` in `Cargo.toml`, update `CHANGELOG.md`'s `[Unreleased]`
+   section to a dated version heading, commit.
+2. Tag the commit `vX.Y.Z` (matching `Cargo.toml`'s version exactly — the
+   workflow checks this and fails the publish if they disagree) and push
+   the tag.
+3. Create a GitHub Release from that tag (UI or `gh release create`).
+   This triggers the workflow, which re-runs `cargo test --release` and
+   `cargo publish --dry-run` as a final gate, then runs `cargo publish`
+   using the `CARGO_REGISTRY_TOKEN` repo secret.
