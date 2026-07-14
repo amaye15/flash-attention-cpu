@@ -58,7 +58,7 @@ jobs:
           short_sha="${GITHUB_SHA:0:8}"
           BENCH_COMMIT="$short_sha" cargo run --release --example bench_quick -- --csv > "bench-${{ matrix.os }}.csv"
       - name: upload bench CSV artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bench-csv-${{ matrix.os }}
           path: bench-${{ matrix.os }}.csv
